@@ -5,7 +5,7 @@ from datetime import datetime
 from rules import ANNOTATION_DB, DISCLAIMER_TEMPLATE
 
 def lookup_annotation(name):
-    """Search for a specific Nginx annotation in the database."""
+    """Search for a specific Nginx annotation in the database and display mapping details."""
     rule = ANNOTATION_DB.get(name)
     
     print(f"\n{'='*60}")
@@ -15,13 +15,13 @@ def lookup_annotation(name):
     if not rule:
         print(f"Status: ❓ UNKNOWN")
         print(f"Result: No mapping found for this annotation.")
-        print(f"Action: Please check HAProxy Ingress official docs manually.")
+        print(f"Action: Please check HAProxy Ingress official documentation manually.")
     else:
-        # Display Status based on type
+        # Map internal types to user-friendly status strings
         status_map = {
-            "direct": "✅ SUPPORTED (Direct Mapping)",
-            "configmap": "⚠️  DEPENDENCY (ConfigMap/Global Settings Required)",
-            "complex": "❌ COMPLEX (Manual Intervention Required)"
+            "direct": " SUPPORTED (Direct Mapping)",
+            "configmap": "  DEPENDENCY (ConfigMap/Global Settings Required)",
+            "complex": " COMPLEX (Manual Intervention Required)"
         }
         print(f"Status: {status_map.get(rule['type'], rule['type'].upper())}")
         
@@ -37,50 +37,73 @@ def lookup_annotation(name):
     print(f"{'='*60}\n")
 
 def convert_ingress(input_file):
-    """Convert Nginx Ingress YAML to HAProxy Ingress YAML."""
+    """
+    Convert Nginx Ingress YAML to HAProxy Ingress YAML.
+    Implements a non-destructive migration by renaming the resource and changing the class.
+    """
     try:
         with open(input_file, 'r', encoding='utf-8') as f:
-            data = yaml.safe_load(f)
+            # Use safe_load_all to support multi-document YAML files
+            docs = yaml.safe_load_all(f)
+            
+            for data in docs:
+                if not data or data.get('kind') != 'Ingress':
+                    continue
 
-        if not data or data.get('kind') != 'Ingress':
-            print("Error: Invalid Ingress YAML.")
-            return
+                # 1. Identity Transformation: Rename to avoid overwriting existing Nginx Ingress
+                old_name = data['metadata'].get('name', 'unnamed')
+                new_name = f"{old_name}-haproxy"
+                data['metadata']['name'] = new_name
 
-        old_annos = data['metadata'].get('annotations', {})
-        new_annos = {}
-        notices = []
+                # 2. Routing Transformation: Update Ingress Class
+                # Update modern spec.ingressClassName
+                if 'spec' in data:
+                    data['spec']['ingressClassName'] = "haproxy"
+                
+                old_annos = data['metadata'].get('annotations', {})
+                new_annos = {}
+                notices = []
 
-        # Core conversion logic
-        for key, value in old_annos.items():
-            if key in ANNOTATION_DB:
-                rule = ANNOTATION_DB[key]
-                if rule['type'] in ['direct', 'configmap']:
-                    new_annos[rule['target']] = value
-                    if rule['type'] == 'configmap':
-                        notices.append(f"[ConfigMap] {rule['target']}: {rule['note']}")
-                else:
-                    notices.append(f"[Manual] {key}: See {rule.get('doc', 'N/A')}")
-            elif "nginx.ingress.kubernetes.io" in key:
-                notices.append(f"[Unknown] {key}: Not found in mapping database.")
+                # 3. Annotation Conversion Logic
+                for key, value in old_annos.items():
+                    # Skip the old ingress class annotation; we will force it to 'haproxy' later
+                    if key == "kubernetes.io/ingress.class":
+                        continue
+                        
+                    if key in ANNOTATION_DB:
+                        rule = ANNOTATION_DB[key]
+                        if rule['type'] in ['direct', 'configmap']:
+                            new_annos[rule['target']] = value
+                            if rule['type'] == 'configmap':
+                                notices.append(f"[ConfigMap] {rule['target']}: {rule['note']}")
+                        else:
+                            notices.append(f"[Manual] {key}: See {rule.get('doc', 'N/A')}")
+                    elif "nginx.ingress.kubernetes.io" in key:
+                        notices.append(f"[Unknown] {key}: Not found in mapping database.")
 
-        # Add Safety/Non-sense Annotations
-        new_annos['migration.status/review-required'] = "true"
-        new_annos['migration.status/last-converted'] = datetime.now().strftime('%Y-%m-%d')
-        new_annos['kubernetes.io/ingress.class'] = "haproxy"
+                # Force HAProxy Ingress Class annotation for backward compatibility
+                new_annos['kubernetes.io/ingress.class'] = "haproxy"
+                
+                # 4. Audit & Safety Annotations
+                new_annos['migration.status/review-required'] = "true"
+                new_annos['migration.status/last-converted'] = datetime.now().strftime('%Y-%m-%d')
+                new_annos['migration.origin/source-name'] = old_name # Traceability to original Ingress
 
-        # Construct new object
-        output_data = data.copy()
-        output_data['metadata']['annotations'] = new_annos
+                data['metadata']['annotations'] = new_annos
 
-        # Final Output to Console
-        print(DISCLAIMER_TEMPLATE)
-        if notices:
-            print("# TODO LIST (Manual Review Required):")
-            for n in notices:
-                print(f"#   - {n}")
-            print("# " + "-"*75 + "\n")
+                # 5. Output Generation
+                print(f"\n# {'#'*78}")
+                print(f"# MIGRATED INGRESS: {old_name} -> {new_name}")
+                print(f"# {'#'*78}")
+                print(DISCLAIMER_TEMPLATE)
+                
+                if notices:
+                    print("# TODO LIST (Manual Review Required):")
+                    for n in notices:
+                        print(f"#   - {n}")
+                    print("# " + "-"*75 + "\n")
 
-        print(yaml.dump(output_data, sort_keys=False, allow_unicode=True))
+                print(yaml.dump(data, sort_keys=False, allow_unicode=True))
 
     except Exception as e:
         print(f"Error during conversion: {e}")
@@ -89,13 +112,13 @@ def main():
     parser = argparse.ArgumentParser(description="Nginx to HAProxy Ingress Migration Tool")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
-    # Convert command: python main.py convert file.yaml
-    conv_p = subparsers.add_parser("convert", help="Convert Nginx YAML to HAProxy YAML")
+    # Convert command: python main.py convert <file.yaml>
+    conv_p = subparsers.add_parser("convert", help="Convert Nginx YAML to HAProxy YAML (Non-destructive)")
     conv_p.add_argument("file", help="Path to the Nginx Ingress YAML file")
     
     # Lookup command: python main.py lookup <annotation-name>
     look_p = subparsers.add_parser("lookup", help="Look up a specific Nginx annotation mapping")
-    look_p.add_argument("name", help="Full name of the Nginx annotation")
+    look_p.add_argument("name", help="Full name of the Nginx annotation (e.g., nginx.ingress.kubernetes.io/auth-type)")
 
     args = parser.parse_args()
 
@@ -108,9 +131,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
 
 
 ----------------------
