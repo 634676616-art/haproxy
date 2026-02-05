@@ -80,36 +80,160 @@ if __name__ == "__main__":
 
 ----------------------
 # -*- coding: utf-8 -*-
-from datetime import datetime
 
-# Disclaimer template for the top of the YAML file
-DISCLAIMER_TEMPLATE = f"""# #############################################################################
-# [WARNING] AUTOMATICALLY GENERATED REFERENCE - Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-# -----------------------------------------------------------------------------
-# DISCLAIMER:
-# 1. This file is a REFERENCE ONLY. DO NOT apply directly to production.
-# 2. All configurations MUST be reviewed and tested by a human engineer.
-# 3. The tool does not guarantee 100% compatibility for complex logic.
-# #############################################################################
-"""
-
+# Annotation Mapping Database extracted from your document
+# Categories:
+#   - 'direct': Can be mapped directly to a HAProxy annotation.
+#   - 'configmap': Requires changes in the HAProxy Ingress Controller ConfigMap or CRDs.
+#   - 'complex': Not supported or requires manual architectural changes (e.g., Canary).
 ANNOTATION_DB = {
+    # --- Sticky Sessions & Affinity ---
+    "nginx.ingress.kubernetes.io/affinity": {
+        "target": "haproxy.org/cookie-persistence",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/affinity-mode": {
+        "target": "haproxy.org/cookie-persistence-no-dynamic",
+        "type": "direct"
+    },
+
+    # --- Authentication ---
     "nginx.ingress.kubernetes.io/auth-type": {
         "target": "haproxy.org/auth-type",
         "type": "direct"
     },
-    "nginx.ingress.kubernetes.io/ssl-redirect": {
+    "nginx.ingress.kubernetes.io/auth-secret": {
+        "target": "haproxy.org/auth-secret",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/auth-realm": {
+        "target": "haproxy.org/auth-realm",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/auth-tls-secret": {
+        "target": "haproxy.org/server-ca",
+        "type": "direct",
+        "note": "Maps to server-ca for backend mTLS."
+    },
+
+    # --- Path & Rewrites ---
+    "nginx.ingress.kubernetes.io/app-root": {
+        "target": "haproxy.org/path-rewrite",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/rewrite-target": {
+        "target": "haproxy.org/path-rewrite",
+        "type": "direct"
+    },
+
+    # --- Backend Protocol & Load Balancing ---
+    "nginx.ingress.kubernetes.io/backend-protocol": {
+        "target": "haproxy.org/server-proto",
+        "type": "direct",
+        "note": "Also consider using haproxy.org/server-ssl if SSL is required."
+    },
+    "nginx.ingress.kubernetes.io/balancer": {
+        "target": "haproxy.org/load-balance",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/load-balance": {
+        "target": "haproxy.org/load-balance",
+        "type": "direct"
+    },
+
+    # --- CORS ---
+    "nginx.ingress.kubernetes.io/enable-cors": {
+        "target": "haproxy.org/cors-enable",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/cors-allow-origin": {
+        "target": "haproxy.org/cors-allow-origin",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/cors-allow-methods": {
+        "target": "haproxy.org/cors-allow-methods",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/cors-allow-headers": {
+        "target": "haproxy.org/cors-allow-headers",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/cors-allow-credentials": {
+        "target": "haproxy.org/cors-allow-credentials",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/cors-max-age": {
+        "target": "haproxy.org/cors-max-age",
+        "type": "direct"
+    },
+
+    # --- Rate Limiting & Timeouts ---
+    "nginx.ingress.kubernetes.io/limit-rps": {
+        "target": "haproxy.org/rate-limit-requests",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/limit-connections": {
+        "target": "haproxy.org/pod-maxconn",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/proxy-connect-timeout": {
+        "target": "haproxy.org/timeout-server",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/proxy-read-timeout": {
+        "target": "haproxy.org/timeout-server",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/proxy-send-timeout": {
+        "target": "haproxy.org/timeout-server",
+        "type": "direct"
+    },
+
+    # --- SSL & Redirects ---
+    "nginx.ingress.kubernetes.io/force-ssl-redirect": {
         "target": "haproxy.org/ssl-redirect",
         "type": "direct"
     },
-    "nginx.ingress.kubernetes.io/proxy-body-size": {
-        "target": "haproxy.org/max-body-size",
+
+    # --- ConfigMap / CRD Dependent (Manual Config Required) ---
+    "nginx.ingress.kubernetes.io/client-body-buffer-size": {
         "type": "configmap",
-        "note": "Check global ConfigMap for max-body-size limits."
+        "note": "Requires Global CRD configuration in HAProxy."
+    },
+    "nginx.ingress.kubernetes.io/client-header-buffer-size": {
+        "type": "configmap",
+        "note": "Requires ConfigMap adjustment for tune.bufsize."
+    },
+    "nginx.ingress.kubernetes.io/proxy-body-size": {
+        "type": "configmap",
+        "note": "Requires ConfigMap adjustment."
+    },
+    "nginx.ingress.kubernetes.io/enable-gzip": {
+        "type": "configmap",
+        "note": "Gzip compression must be enabled in the global ConfigMap."
+    },
+    "nginx.ingress.kubernetes.io/enable-websocket": {
+        "type": "configmap",
+        "note": "Websocket support is usually global in HAProxy ConfigMap."
+    },
+
+    # --- Complex / Not Supported ---
+    "nginx.ingress.kubernetes.io/canary": {
+        "type": "complex",
+        "note": "Use HAProxy native Canary Deployment strategies or specific CRDs.",
+        "doc": "https://haproxy-ingress.github.io/docs/configuration/keys/#canary"
     },
     "nginx.ingress.kubernetes.io/configuration-snippet": {
         "type": "complex",
-        "doc": "https://haproxy-ingress.github.io/docs/configuration/keys/#configuration-snippet",
-        "note": "Incompatible syntax. Manual rewrite required."
+        "note": "Requires Backend CRD. Nginx snippets are not compatible with HAProxy configuration.",
+        "doc": "https://haproxy-ingress.github.io/docs/configuration/keys/#configuration-snippet"
+    },
+    "nginx.ingress.kubernetes.io/add-headers": {
+        "type": "complex",
+        "note": "Not supported via direct annotation in OSS. Use ConfigMap or custom logic."
+    },
+    "nginx.ingress.kubernetes.io/auth-signin": {
+        "type": "complex",
+        "note": "Enterprise edition only. Not supported in OSS version."
     }
 }
