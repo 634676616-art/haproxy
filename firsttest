@@ -1,0 +1,115 @@
+import argparse
+import yaml
+import sys
+from datetime import datetime
+from rules import ANNOTATION_DB, DISCLAIMER_TEMPLATE
+
+def convert_ingress(input_file):
+    try:
+        with open(input_file, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+
+        if not data or data.get('kind') != 'Ingress':
+            print("Error: Invalid Ingress YAML.")
+            return
+
+        old_annos = data['metadata'].get('annotations', {})
+        new_annos = {}
+        notices = []
+
+        # Core conversion logic
+        for key, value in old_annos.items():
+            if key in ANNOTATION_DB:
+                rule = ANNOTATION_DB[key]
+                if rule['type'] in ['direct', 'configmap']:
+                    new_annos[rule['target']] = value
+                    if rule['type'] == 'configmap':
+                        notices.append(f"[ConfigMap] {rule['target']}: {rule['note']}")
+                else:
+                    notices.append(f"[Manual] {key}: See {rule['doc']}")
+            elif "nginx.ingress.kubernetes.io" in key:
+                notices.append(f"[Unknown] {key}: Not mapped.")
+
+        # Add Safety/Non-sense Annotations
+        new_annos['migration.status/review-required'] = "true"
+        new_annos['migration.status/last-converted'] = datetime.now().strftime('%Y-%m-%d')
+        new_annos['kubernetes.io/ingress.class'] = "haproxy"
+
+        # Construct new object
+        output_data = data.copy()
+        output_data['metadata']['annotations'] = new_annos
+
+        # Final Output
+        print(DISCLAIMER_TEMPLATE)
+        if notices:
+            print("# TODO LIST:")
+            for n in notices:
+                print(f"#   - {n}")
+            print("# " + "-"*75 + "\n")
+
+        print(yaml.dump(output_data, sort_keys=False, allow_unicode=True))
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Ingress Migration Tool")
+    subparsers = parser.add_subparsers(dest="command")
+    
+    # Convert command
+    conv_p = subparsers.add_parser("convert")
+    conv_p.add_argument("file")
+    
+    # Lookup command
+    look_p = subparsers.add_parser("lookup")
+    look_p.add_argument("name")
+
+    args = parser.parse_args()
+    if args.command == "convert":
+        convert_ingress(args.file)
+    elif args.command == "lookup":
+        # Simplified lookup for brevity
+        print(f"Lookup logic for {args.name}...") 
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+----------------------
+# -*- coding: utf-8 -*-
+from datetime import datetime
+
+# Disclaimer template for the top of the YAML file
+DISCLAIMER_TEMPLATE = f"""# #############################################################################
+# [WARNING] AUTOMATICALLY GENERATED REFERENCE - Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+# -----------------------------------------------------------------------------
+# DISCLAIMER:
+# 1. This file is a REFERENCE ONLY. DO NOT apply directly to production.
+# 2. All configurations MUST be reviewed and tested by a human engineer.
+# 3. The tool does not guarantee 100% compatibility for complex logic.
+# #############################################################################
+"""
+
+ANNOTATION_DB = {
+    "nginx.ingress.kubernetes.io/auth-type": {
+        "target": "haproxy.org/auth-type",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/ssl-redirect": {
+        "target": "haproxy.org/ssl-redirect",
+        "type": "direct"
+    },
+    "nginx.ingress.kubernetes.io/proxy-body-size": {
+        "target": "haproxy.org/max-body-size",
+        "type": "configmap",
+        "note": "Check global ConfigMap for max-body-size limits."
+    },
+    "nginx.ingress.kubernetes.io/configuration-snippet": {
+        "type": "complex",
+        "doc": "https://haproxy-ingress.github.io/docs/configuration/keys/#configuration-snippet",
+        "note": "Incompatible syntax. Manual rewrite required."
+    }
+}
