@@ -4,7 +4,40 @@ import sys
 from datetime import datetime
 from rules import ANNOTATION_DB, DISCLAIMER_TEMPLATE
 
+def lookup_annotation(name):
+    """Search for a specific Nginx annotation in the database."""
+    rule = ANNOTATION_DB.get(name)
+    
+    print(f"\n{'='*60}")
+    print(f"SEARCH RESULT FOR: {name}")
+    print(f"{'='*60}")
+
+    if not rule:
+        print(f"Status: ❓ UNKNOWN")
+        print(f"Result: No mapping found for this annotation.")
+        print(f"Action: Please check HAProxy Ingress official docs manually.")
+    else:
+        # Display Status based on type
+        status_map = {
+            "direct": "✅ SUPPORTED (Direct Mapping)",
+            "configmap": "⚠️  DEPENDENCY (ConfigMap/Global Settings Required)",
+            "complex": "❌ COMPLEX (Manual Intervention Required)"
+        }
+        print(f"Status: {status_map.get(rule['type'], rule['type'].upper())}")
+        
+        if "target" in rule:
+            print(f"Target: {rule['target']}")
+        
+        if "note" in rule:
+            print(f"Note:   {rule['note']}")
+            
+        if "doc" in rule:
+            print(f"Docs:   {rule['doc']}")
+    
+    print(f"{'='*60}\n")
+
 def convert_ingress(input_file):
+    """Convert Nginx Ingress YAML to HAProxy Ingress YAML."""
     try:
         with open(input_file, 'r', encoding='utf-8') as f:
             data = yaml.safe_load(f)
@@ -26,9 +59,9 @@ def convert_ingress(input_file):
                     if rule['type'] == 'configmap':
                         notices.append(f"[ConfigMap] {rule['target']}: {rule['note']}")
                 else:
-                    notices.append(f"[Manual] {key}: See {rule['doc']}")
+                    notices.append(f"[Manual] {key}: See {rule.get('doc', 'N/A')}")
             elif "nginx.ingress.kubernetes.io" in key:
-                notices.append(f"[Unknown] {key}: Not mapped.")
+                notices.append(f"[Unknown] {key}: Not found in mapping database.")
 
         # Add Safety/Non-sense Annotations
         new_annos['migration.status/review-required'] = "true"
@@ -39,10 +72,10 @@ def convert_ingress(input_file):
         output_data = data.copy()
         output_data['metadata']['annotations'] = new_annos
 
-        # Final Output
+        # Final Output to Console
         print(DISCLAIMER_TEMPLATE)
         if notices:
-            print("# TODO LIST:")
+            print("# TODO LIST (Manual Review Required):")
             for n in notices:
                 print(f"#   - {n}")
             print("# " + "-"*75 + "\n")
@@ -50,26 +83,28 @@ def convert_ingress(input_file):
         print(yaml.dump(output_data, sort_keys=False, allow_unicode=True))
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error during conversion: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Ingress Migration Tool")
-    subparsers = parser.add_subparsers(dest="command")
+    parser = argparse.ArgumentParser(description="Nginx to HAProxy Ingress Migration Tool")
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
-    # Convert command
-    conv_p = subparsers.add_parser("convert")
-    conv_p.add_argument("file")
+    # Convert command: python main.py convert file.yaml
+    conv_p = subparsers.add_parser("convert", help="Convert Nginx YAML to HAProxy YAML")
+    conv_p.add_argument("file", help="Path to the Nginx Ingress YAML file")
     
-    # Lookup command
-    look_p = subparsers.add_parser("lookup")
-    look_p.add_argument("name")
+    # Lookup command: python main.py lookup <annotation-name>
+    look_p = subparsers.add_parser("lookup", help="Look up a specific Nginx annotation mapping")
+    look_p.add_argument("name", help="Full name of the Nginx annotation")
 
     args = parser.parse_args()
+
     if args.command == "convert":
         convert_ingress(args.file)
     elif args.command == "lookup":
-        # Simplified lookup for brevity
-        print(f"Lookup logic for {args.name}...") 
+        lookup_annotation(args.name)
+    else:
+        parser.print_help()
 
 if __name__ == "__main__":
     main()
