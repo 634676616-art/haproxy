@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+from kubernetes import client, config
+from kubernetes.client import ApiException
+
+try:
+    from jinja2 import Environment, FileSystemLoader, StrictUndefined
+except ImportError:
+    print("Missing dependency: jinja2. Install with: pip install jinja2", file=sys.stderr)
+    raise
+
+
+@dataclass
+class TenantIdentity:
+    tenant_full: str      # e.g. t-25690968-foo
+    userid: str           # e.g. 25690968
+    tenant_short: str     # e.g. foo
+
+
+@dataclass
+class TenantPlan:
+    tenant_full: str
+    tenant_short: str
+    userid: str
+    namespace: str
+    release: str
+    old_nodeport_https: int
+    new_nodeport_https: int
+    ingress_class: str
+    passthrough: bool
+    rq_name: str
+    rq_patched: bool
+    values_path: str
+    helm_applied: bool
+    skipped_reason: Optional[str] = None
+
+
+def run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=check, text=True, capture_output=True)
+
+
+def load_kube():
+    # If running in-cluster, use: config.load_incluster_config()
+    config.load_kube_config()
+
+
+# ----------------------------
+# Capsule tenant discovery
+# ----------------------------
+
+def list_capsule_tenants(
+    custom: client.CustomObjectsApi,
+    group: str,
+    version: str,
+    plural: str,
+) -> List[str]:
+    obj = custom.list_cluster_custom_object(group=group, version=version, plural=plural)
+    items = obj.get("items", [])
+    names = []
+    for i in items:
+        n = i.get("metadata", {}).get("name")
+        if n:
+            names.append(n)
+    return sorted(names)
+
+
+def parse_tenant_identity(tenant_full: str, tenant_name_regex: str) -> TenantIdentity:
+    """
+    Default tenant_full format: t-<userid>-<tenantName>
+    Regex must provide 2 capture groups: (userid) and (tenant_short)
+    """
+    m = re.match(tenant_name_regex, tenant_full)
+    if not m:
+        raise ValueError(f"Tenant name '{tenant_full}' does not match regex '{tenant_name_regex}'")
+    userid = m.group(1)
+    tenant_short = m.group(2)
+    return TenantIdentity(tenant_full=tenant_full, userid=userid, tenant_short=tenant_short)
+
+
+def tenant_to_ingress_namespace(identity: TenantIdentity, suffix: str, ns_from: str) -> str:
+    base = identity.tenant_full if ns_from == "full" else identity.tenant_short
+    return f"{base}{suffix}"
+
+
+# ----------------------------
+# Old NGINX inspection
+# ----------------------------
+
+def get_https_single_nodeport_or_raise(v1: client.CoreV1Api, namespace: str, svc_name: str) -> int:
+    svc = v1.read_namespaced_service(svc_name, namespace)
+    if svc.spec.type != "NodePort":
+        raise ValueError(f"{namespace}/{svc_name} is not NodePort (type={svc.spec.type})")
+
+    ports = svc.spec.ports or []
+    nodeports = [p.node_port for p in ports if p.node_port]
+
+    # Policy: exactly one nodePort total; anything else -> skip
+    if len(nodeports) != 1:
+        details = [(p.name, p.port, p.target_port, p.node_port) for p in ports]
+        raise ValueError(f"expected exactly 1 nodePort; got {len(nodeports)}; ports={details}")
+
+    https_ports = [p for p in ports if p.name == "https" and p.node_port]
+    if len(https_ports) != 1:
+        details = [(p.name, p.port, p.target_port, p.node_port) for p in ports]
+        raise ValueError(f"expected named port 'https' with nodePort; ports={details}")
+
+    return int(https_ports[0].node_port)
+
+
+def nodeport_in_use(v1: client.CoreV1Api, nodeport: int) -> bool:
+    svcs = v1.list_service_for_all_namespaces().items
+    for s in svcs:
+        for p in (s.spec.ports or []):
+            if p.node_port == nodeport:
+                return True
+    return False
+
+
+# ----------------------------
+# Naming: release / class
+# ----------------------------
+
+def derive_ingress_class(pattern: str, identity: TenantIdentity) -> str:
+    return pattern.format(
+        tenant_full=identity.tenant_full,
+        tenant_short=identity.tenant_short,
+        userid=identity.userid,
+    )
+
+
+def derive_release_name(pattern: str, identity: TenantIdentity) -> str:
+    return pattern.format(
+        tenant_full=identity.tenant_full,
+        tenant_short=identity.tenant_short,
+        userid=identity.userid,
+    )
+
+
+# ----------------------------
+# Passthrough detection (heuristic)
+# ----------------------------
+
+def detect_passthrough_from_deployment_args(
+    apps: client.AppsV1Api,
+    namespace: str,
+    deploy_name: str,
+) -> bool:
+    dep = apps.read_namespaced_deployment(deploy_name, namespace)
+    containers = dep.spec.template.spec.containers or []
+    for c in containers:
+        for a in (c.args or []):
+            la = a.lower()
+            if "passthrough" in la:
+                # treat presence as enabled (best-effort)
+                return True
+    return False
+
+
+# ----------------------------
+# ResourceQuota patching
+# ----------------------------
+
+def patch_resourcequota_nodeports(
+    v1: client.CoreV1Api,
+    namespace: str,
+    rq_name: str,
+    increment: int = 1,
+    key: str = "services.nodeports",
+) -> bool:
+    rq = v1.read_namespaced_resource_quota(rq_name, namespace)
+    hard = rq.spec.hard or {}
+    if key not in hard:
+        raise ValueError(f"ResourceQuota {namespace}/{rq_name} missing spec.hard['{key}']")
+
+    current = int(str(hard[key]))
+    new_val = str(current + increment)
+
+    body = {"spec": {"hard": {key: new_val}}}
+    v1.patch_namespaced_resource_quota(rq_name, namespace, body)
+    return True
+
+
+# ----------------------------
+# Infra capacity check
+# ----------------------------
+
+def parse_cpu_to_millicores(cpu: str) -> int:
+    if cpu.endswith("m"):
+        return int(cpu[:-1])
+    return int(float(cpu) * 1000)
+
+
+def infra_cpu_request_ratio(
+    v1: client.CoreV1Api,
+    infra_label_selector: str,
+) -> Tuple[float, int, int]:
+    nodes = v1.list_node(label_selector=infra_label_selector).items
+    if not nodes:
+        raise RuntimeError(f"No infra nodes found for selector: {infra_label_selector}")
+
+    infra_node_names = {n.metadata.name for n in nodes}
+
+    alloc_m = 0
+    for n in nodes:
+        alloc_cpu = n.status.allocatable.get("cpu")
+        alloc_m += parse_cpu_to_millicores(alloc_cpu)
+
+    pods = v1.list_pod_for_all_namespaces().items
+    req_m = 0
+    for p in pods:
+        if not p.spec or not p.spec.node_name:
+            continue
+        if p.spec.node_name not in infra_node_names:
+            continue
+        for c in (p.spec.containers or []):
+            req = (c.resources.requests or {}) if c.resources else {}
+            cpu = req.get("cpu")
+            if cpu:
+                req_m += parse_cpu_to_millicores(cpu)
+
+    ratio = (req_m / alloc_m) if alloc_m else 1.0
+    return ratio, req_m, alloc_m
+
+
+# ----------------------------
+# Values generation (Jinja2)
+# ----------------------------
+
+def render_values_template(
+    template_path: str,
+    out_path: str,
+    context: Dict[str, object],
+) -> None:
+    template_dir = os.path.dirname(os.path.abspath(template_path)) or "."
+    template_file = os.path.basename(template_path)
+
+    env = Environment(
+        loader=FileSystemLoader(template_dir),
+        undefined=StrictUndefined,  # fail fast if template references missing var
+        autoescape=False,
+        keep_trailing_newline=True,
+    )
+    tmpl = env.get_template(template_file)
+    rendered = tmpl.render(**context)
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(rendered)
+
+
+# ----------------------------
+# Helm apply
+# ----------------------------
+
+def helm_upgrade_install(
+    release: str,
+    namespace: str,
+    chart: str,
+    values_file: str,
+) -> None:
+    cmd = [
+        "helm", "upgrade", "--install",
+        release, chart,
+        "-n", namespace,
+        "-f", values_file,
+        "--create-namespace",
+    ]
+    cp = run(cmd, check=False)
+    if cp.returncode != 0:
+        raise RuntimeError(
+            "helm failed\n"
+            f"CMD: {' '.join(cmd)}\n"
+            f"STDOUT:\n{cp.stdout}\n"
+            f"STDERR:\n{cp.stderr}\n"
+        )
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Bulk install HAProxy official ingress POC per Capsule tenant")
+
+    # Mode
+    ap.add_argument("--mode", choices=["cluster", "tenant"], required=True)
+    ap.add_argument("--tenant", help="Tenant CR name (full), e.g. t-25690968-foo, when --mode tenant")
+    ap.add_argument("--namespace", help="Override namespace when --mode tenant (optional)")
+
+    # Capsule tenant CRD (for --mode cluster)
+    ap.add_argument("--capsule-group", default="capsule.clastix.io")
+    ap.add_argument("--capsule-version", default="v1beta1")
+    ap.add_argument("--capsule-plural", default="tenants")
+
+    # Tenant naming
+    ap.add_argument(
+        "--tenant-name-regex",
+        default=r"^t-(\d+)-(.+)$",
+        help=r"Regex with 2 capture groups: userid and tenant_short. Default: ^t-(\d+)-(.+)$",
+    )
+
+    # Namespace convention (you confirmed tenant_full)
+    ap.add_argument("--ns-suffix", default="-ingress", help="Ingress namespace suffix, default: -ingress")
+    ap.add_argument(
+        "--ns-from",
+        choices=["full", "short"],
+        default="full",
+        help="Namespace base derived from tenant_full or tenant_short. Default: full",
+    )
+
+    # Naming conventions
+    ap.add_argument(
+        "--ingress-class-pattern",
+        default="{tenant_short}-haproxy",
+        help="IngressClass pattern supports {tenant_full},{tenant_short},{userid}",
+    )
+    ap.add_argument(
+        "--release-pattern",
+        default="haproxy-ingress-poc-{tenant_short}",
+        help="Release name pattern supports {tenant_full},{tenant_short},{userid}",
+    )
+
+    # Old NGINX (k8s community inc)
+    ap.add_argument("--nginx-svc", default="xxx-ingress-nginx-controller", help="Old nginx controller Service name")
+    ap.add_argument("--nginx-deploy", default="xxxx-inc1-ingress-nginx-controller", help="Old nginx controller Deployment name")
+
+    # HAProxy official chart
+    ap.add_argument("--chart", required=True, help="HAProxy official chart (path or repo/chart)")
+
+    # Values template and output
+    ap.add_argument("--values-template", required=True, help="Jinja2 values template file, e.g. values-template.yaml.j2")
+    ap.add_argument("--values-out-dir", required=True, help="Directory to write per-tenant values.yaml")
+
+    # Quota patching
+    ap.add_argument(
+        "--rq-template",
+        default="capsule-t-{userid}-{tenant_short}-0",
+        help="ResourceQuota name template supports {userid},{tenant_short},{tenant_full}. Default: capsule-t-{userid}-{tenant_short}-0",
+    )
+    ap.add_argument("--rq-key", default="services.nodeports", help="ResourceQuota hard key to increment")
+
+    # Infra capacity check
+    ap.add_argument("--infra-selector", default="infra_node=true", help="Infra node label selector, e.g. infra_node=true")
+    ap.add_argument("--cpu-threshold", type=float, default=0.90, help="Abort if infra cpu requests ratio >= threshold")
+
+    # Behavior
+    ap.add_argument("--dry-run", action="store_true", help="Do not patch quota and do not run helm")
+    ap.add_argument("--continue-on-error", action="store_true", help="Continue processing tenants after failures")
+
+    args = ap.parse_args()
+
+    load_kube()
+    v1 = client.CoreV1Api()
+    apps = client.AppsV1Api()
+    custom = client.CustomObjectsApi()
+
+    ratio, req_m, alloc_m = infra_cpu_request_ratio(v1, args.infra_selector)
+    print(f"[PRECHECK] Infra CPU requests: {req_m}m / {alloc_m}m = {ratio:.2%}")
+    if ratio >= args.cpu_threshold:
+        print("[ABORT] Infra cpu requests too high; refusing to deploy.", file=sys.stderr)
+        sys.exit(2)
+
+    # Determine tenant CR names
+    if args.mode == "cluster":
+        tenant_full_names = list_capsule_tenants(custom, args.capsule_group, args.capsule_version, args.capsule_plural)
+        if not tenant_full_names:
+            print("[WARN] No tenants found from Capsule CRs.")
+    else:
+        if not args.tenant:
+            print("[ERROR] --tenant is required when --mode tenant", file=sys.stderr)
+            sys.exit(2)
+        tenant_full_names = [args.tenant]
+
+    plans: List[TenantPlan] = []
+    failures = 0
+
+    for tenant_full in tenant_full_names:
+        try:
+            ident = parse_tenant_identity(tenant_full, args.tenant_name_regex)
+        except Exception as e:
+            failures += 1
+            print(f"[FAIL] tenant_full={tenant_full}: cannot parse identity: {e}", file=sys.stderr)
+            if not args.continue_on_error:
+                break
+            continue
+
+        ns = args.namespace if (args.mode == "tenant" and args.namespace) else tenant_to_ingress_namespace(ident, args.ns_suffix, args.ns_from)
+        release = derive_release_name(args.release_pattern, ident)
+        ingress_class = derive_ingress_class(args.ingress_class_pattern, ident)
+        rq_name = args.rq_template.format(userid=ident.userid, tenant_short=ident.tenant_short, tenant_full=ident.tenant_full)
+
+        plan = TenantPlan(
+            tenant_full=ident.tenant_full,
+            tenant_short=ident.tenant_short,
+            userid=ident.userid,
+            namespace=ns,
+            release=release,
+            old_nodeport_https=-1,
+            new_nodeport_https=-1,
+            ingress_class=ingress_class,
+            passthrough=False,
+            rq_name=rq_name,
+            rq_patched=False,
+            values_path="",
+            helm_applied=False,
+        )
+
+        try:
+            old_np = get_https_single_nodeport_or_raise(v1, ns, args.nginx_svc)
+            new_np = old_np + 1000
+
+            plan.old_nodeport_https = old_np
+            plan.new_nodeport_https = new_np
+
+            if nodeport_in_use(v1, new_np):
+                plan.skipped_reason = f"new nodePort {new_np} already in use in cluster"
+                print(f"[SKIP] tenant_full={ident.tenant_full} ns={ns}: {plan.skipped_reason}")
+                plans.append(plan)
+                continue
+
+            try:
+                plan.passthrough = detect_passthrough_from_deployment_args(apps, ns, args.nginx_deploy)
+            except ApiException as e:
+                print(f"[WARN] tenant_full={ident.tenant_full} ns={ns}: cannot read nginx deployment {args.nginx_deploy}: {e}")
+                plan.passthrough = False
+
+            if not args.dry_run:
+                plan.rq_patched = patch_resourcequota_nodeports(v1, ns, rq_name, increment=1, key=args.rq_key)
+
+            out_file = os.path.join(args.values_out_dir, ident.tenant_full, "values.yaml")
+            ctx = {
+                "tenant_full": ident.tenant_full,
+                "tenant_short": ident.tenant_short,
+                "tenant": ident.tenant_short,   # alias
+                "namespace": ns,
+                "userid": ident.userid,
+                "release": release,
+                "ingress_class": ingress_class,
+                "nodeport_https": new_np,
+                "passthrough": plan.passthrough,
+                "old_nodeport_https": old_np,
+                "chart": args.chart,
+            }
+            render_values_template(args.values_template, out_file, ctx)
+            plan.values_path = out_file
+
+            if not args.dry_run:
+                helm_upgrade_install(release, ns, args.chart, out_file)
+                plan.helm_applied = True
+
+            print(
+                f"[OK] tenant_full={ident.tenant_full} userid={ident.userid} tenant_short={ident.tenant_short} "
+                f"ns={ns} (from tenant_full) release={release} oldNP={old_np} newNP={new_np} "
+                f"class={ingress_class} passthrough={plan.passthrough} rq={rq_name} "
+                f"rqPatched={plan.rq_patched} values={out_file} helm={plan.helm_applied}"
+            )
+            plans.append(plan)
+
+        except Exception as e:
+            failures += 1
+            plan.skipped_reason = str(e)
+            plans.append(plan)
+            print(f"[FAIL] tenant_full={ident.tenant_full} ns={ns}: {e}", file=sys.stderr)
+            if not args.continue_on_error:
+                break
+
+    ok = sum(1 for p in plans if p.helm_applied or (args.dry_run and not p.skipped_reason))
+    skipped = sum(1 for p in plans if p.skipped_reason and not p.helm_applied)
+    print(f"\n[SUMMARY] tenants_total={len(plans)} ok={ok} skipped_or_failed={skipped} failures={failures}")
+    if failures and not args.continue_on_error:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
