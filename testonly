@@ -2,198 +2,135 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import json
 import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
+import yaml
 from kubernetes import client, config
 from kubernetes.client import ApiException
 
-try:
-    from jinja2 import Environment, FileSystemLoader, StrictUndefined
-except ImportError:
-    print("Missing dependency: jinja2. Install with: pip install jinja2", file=sys.stderr)
-    raise
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
+
+# ----------------------------
+# Models
+# ----------------------------
 
 @dataclass
 class TenantIdentity:
     tenant_full: str      # e.g. t-25690968-foo
     userid: str           # e.g. 25690968
     tenant_short: str     # e.g. foo
+    namespace: str        # e.g. t-25690968-foo-ingress
 
 
 @dataclass
-class TenantPlan:
+class NodePortCollision:
+    nodeport: int
+    planned_tenants: List[str]  # tenant_full list planning to use it
+    existing_services: List[str]  # "ns/name" services already using it
+
+
+@dataclass
+class TenantResult:
     tenant_full: str
     tenant_short: str
     userid: str
     namespace: str
     release: str
-    old_nodeport_https: int
-    new_nodeport_https: int
     ingress_class: str
-    passthrough: bool
-    rq_name: str
-    rq_patched: bool
-    values_path: str
-    helm_applied: bool
-    skipped_reason: Optional[str] = None
+    old_nodeport_https: Optional[int] = None
+    new_nodeport_https: Optional[int] = None
+    passthrough: Optional[bool] = None
+    rq_name: Optional[str] = None
+    rq_patched: bool = False
+    values_path: Optional[str] = None
+    helm_applied: bool = False
+    status: str = "UNKNOWN"  # SUCCESS | FAILED | SKIPPED
+    reason: Optional[str] = None
 
 
-def run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=check, text=True, capture_output=True)
+@dataclass
+class Report:
+    started_at_utc: str
+    finished_at_utc: str
+    dry_run: bool
+
+    infra_selector: str
+    infra_cpu_requests_m: int
+    infra_cpu_allocatable_m: int
+    infra_cpu_ratio: float
+    infra_threshold: float
+    infra_ok: bool
+
+    tenants_total: int
+    tenants_success: int
+    tenants_failed: int
+    tenants_skipped: int
+
+    global_abort_reason: Optional[str]
+    nodeport_collisions: List[NodePortCollision]
+    results: List[TenantResult]
+
+
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def run(cmd: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, text=True, capture_output=True)
 
 
 def load_kube():
-    # If running in-cluster, use: config.load_incluster_config()
+    # If running in-cluster: config.load_incluster_config()
     config.load_kube_config()
 
 
-# ----------------------------
-# Capsule tenant discovery
-# ----------------------------
-
-def list_capsule_tenants(
-    custom: client.CustomObjectsApi,
-    group: str,
-    version: str,
-    plural: str,
-) -> List[str]:
-    obj = custom.list_cluster_custom_object(group=group, version=version, plural=plural)
-    items = obj.get("items", [])
-    names = []
-    for i in items:
-        n = i.get("metadata", {}).get("name")
-        if n:
-            names.append(n)
-    return sorted(names)
+def read_yaml_file(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Config must be a YAML mapping/object: {path}")
+    return data
 
 
-def parse_tenant_identity(tenant_full: str, tenant_name_regex: str) -> TenantIdentity:
-    """
-    Default tenant_full format: t-<userid>-<tenantName>
-    Regex must provide 2 capture groups: (userid) and (tenant_short)
-    """
-    m = re.match(tenant_name_regex, tenant_full)
-    if not m:
-        raise ValueError(f"Tenant name '{tenant_full}' does not match regex '{tenant_name_regex}'")
-    userid = m.group(1)
-    tenant_short = m.group(2)
-    return TenantIdentity(tenant_full=tenant_full, userid=userid, tenant_short=tenant_short)
+def must_get(d: Dict[str, Any], path: str) -> Any:
+    cur: Any = d
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            raise KeyError(f"Missing config key: {path}")
+        cur = cur[part]
+    return cur
 
 
-def tenant_to_ingress_namespace(identity: TenantIdentity, suffix: str, ns_from: str) -> str:
-    base = identity.tenant_full if ns_from == "full" else identity.tenant_short
-    return f"{base}{suffix}"
+def get(d: Dict[str, Any], path: str, default: Any = None) -> Any:
+    try:
+        return must_get(d, path)
+    except KeyError:
+        return default
+
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
 
 
 # ----------------------------
-# Old NGINX inspection
-# ----------------------------
-
-def get_https_single_nodeport_or_raise(v1: client.CoreV1Api, namespace: str, svc_name: str) -> int:
-    svc = v1.read_namespaced_service(svc_name, namespace)
-    if svc.spec.type != "NodePort":
-        raise ValueError(f"{namespace}/{svc_name} is not NodePort (type={svc.spec.type})")
-
-    ports = svc.spec.ports or []
-    nodeports = [p.node_port for p in ports if p.node_port]
-
-    # Policy: exactly one nodePort total; anything else -> skip
-    if len(nodeports) != 1:
-        details = [(p.name, p.port, p.target_port, p.node_port) for p in ports]
-        raise ValueError(f"expected exactly 1 nodePort; got {len(nodeports)}; ports={details}")
-
-    https_ports = [p for p in ports if p.name == "https" and p.node_port]
-    if len(https_ports) != 1:
-        details = [(p.name, p.port, p.target_port, p.node_port) for p in ports]
-        raise ValueError(f"expected named port 'https' with nodePort; ports={details}")
-
-    return int(https_ports[0].node_port)
-
-
-def nodeport_in_use(v1: client.CoreV1Api, nodeport: int) -> bool:
-    svcs = v1.list_service_for_all_namespaces().items
-    for s in svcs:
-        for p in (s.spec.ports or []):
-            if p.node_port == nodeport:
-                return True
-    return False
-
-
-# ----------------------------
-# Naming: release / class
-# ----------------------------
-
-def derive_ingress_class(pattern: str, identity: TenantIdentity) -> str:
-    return pattern.format(
-        tenant_full=identity.tenant_full,
-        tenant_short=identity.tenant_short,
-        userid=identity.userid,
-    )
-
-
-def derive_release_name(pattern: str, identity: TenantIdentity) -> str:
-    return pattern.format(
-        tenant_full=identity.tenant_full,
-        tenant_short=identity.tenant_short,
-        userid=identity.userid,
-    )
-
-
-# ----------------------------
-# Passthrough detection (heuristic)
-# ----------------------------
-
-def detect_passthrough_from_deployment_args(
-    apps: client.AppsV1Api,
-    namespace: str,
-    deploy_name: str,
-) -> bool:
-    dep = apps.read_namespaced_deployment(deploy_name, namespace)
-    containers = dep.spec.template.spec.containers or []
-    for c in containers:
-        for a in (c.args or []):
-            la = a.lower()
-            if "passthrough" in la:
-                # treat presence as enabled (best-effort)
-                return True
-    return False
-
-
-# ----------------------------
-# ResourceQuota patching
-# ----------------------------
-
-def patch_resourcequota_nodeports(
-    v1: client.CoreV1Api,
-    namespace: str,
-    rq_name: str,
-    increment: int = 1,
-    key: str = "services.nodeports",
-) -> bool:
-    rq = v1.read_namespaced_resource_quota(rq_name, namespace)
-    hard = rq.spec.hard or {}
-    if key not in hard:
-        raise ValueError(f"ResourceQuota {namespace}/{rq_name} missing spec.hard['{key}']")
-
-    current = int(str(hard[key]))
-    new_val = str(current + increment)
-
-    body = {"spec": {"hard": {key: new_val}}}
-    v1.patch_namespaced_resource_quota(rq_name, namespace, body)
-    return True
-
-
-# ----------------------------
-# Infra capacity check
+# Infra validation
 # ----------------------------
 
 def parse_cpu_to_millicores(cpu: str) -> int:
+    # "100m" -> 100, "2" -> 2000
+    cpu = str(cpu).strip()
     if cpu.endswith("m"):
         return int(cpu[:-1])
     return int(float(cpu) * 1000)
@@ -232,41 +169,143 @@ def infra_cpu_request_ratio(
 
 
 # ----------------------------
-# Values generation (Jinja2)
+# Capsule tenant discovery + parsing
 # ----------------------------
 
-def render_values_template(
-    template_path: str,
-    out_path: str,
-    context: Dict[str, object],
+def list_capsule_tenant_names(
+    custom: client.CustomObjectsApi,
+    group: str,
+    version: str,
+    plural: str,
+) -> List[str]:
+    obj = custom.list_cluster_custom_object(group=group, version=version, plural=plural)
+    items = obj.get("items", [])
+    names = []
+    for i in items:
+        n = i.get("metadata", {}).get("name")
+        if n:
+            names.append(n)
+    return sorted(names)
+
+
+def parse_tenant_identity(tenant_full: str, tenant_regex: str, ns_suffix: str) -> TenantIdentity:
+    m = re.match(tenant_regex, tenant_full)
+    if not m:
+        raise ValueError(f"Tenant '{tenant_full}' does not match regex '{tenant_regex}'")
+    userid = m.group(1)
+    tenant_short = m.group(2)
+    namespace = f"{tenant_full}{ns_suffix}"  # fixed: tenant_full + "-ingress"
+    return TenantIdentity(tenant_full=tenant_full, userid=userid, tenant_short=tenant_short, namespace=namespace)
+
+
+# ----------------------------
+# Old NGINX inspection
+# ----------------------------
+
+def get_https_nodeport_strict(
+    v1: client.CoreV1Api,
+    namespace: str,
+    svc_name: str,
+    https_port_name: str,
+    require_single_nodeport: bool,
+) -> int:
+    svc = v1.read_namespaced_service(svc_name, namespace)
+    if svc.spec.type != "NodePort":
+        raise ValueError(f"{namespace}/{svc_name} is not NodePort (type={svc.spec.type})")
+
+    ports = svc.spec.ports or []
+    nodeports = [p.node_port for p in ports if p.node_port]
+
+    if require_single_nodeport and len(nodeports) != 1:
+        details = [(p.name, p.port, p.target_port, p.node_port) for p in ports]
+        raise ValueError(f"expected exactly 1 nodePort in service; got {len(nodeports)}; ports={details}")
+
+    https_ports = [p for p in ports if p.name == https_port_name and p.node_port]
+    if len(https_ports) != 1:
+        details = [(p.name, p.port, p.target_port, p.node_port) for p in ports]
+        raise ValueError(f"expected named port '{https_port_name}' with nodePort; ports={details}")
+
+    return int(https_ports[0].node_port)
+
+
+def build_nodeport_index(v1: client.CoreV1Api) -> Dict[int, List[str]]:
+    """
+    Returns:
+      nodePort -> ["ns/name", ...]
+    """
+    idx: Dict[int, List[str]] = {}
+    svcs = v1.list_service_for_all_namespaces().items
+    for s in svcs:
+        ns = s.metadata.namespace
+        name = s.metadata.name
+        for p in (s.spec.ports or []):
+            if p.node_port:
+                idx.setdefault(int(p.node_port), []).append(f"{ns}/{name}")
+    return idx
+
+
+# ----------------------------
+# Passthrough detection (heuristic)
+# ----------------------------
+
+def detect_passthrough_from_deployment_args(
+    apps: client.AppsV1Api,
+    namespace: str,
+    deploy_name: str,
+) -> bool:
+    dep = apps.read_namespaced_deployment(deploy_name, namespace)
+    containers = dep.spec.template.spec.containers or []
+    for c in containers:
+        for a in (c.args or []):
+            if "passthrough" in str(a).lower():
+                return True
+    return False
+
+
+# ----------------------------
+# ResourceQuota patch
+# ----------------------------
+
+def patch_resourcequota_nodeports(
+    v1: client.CoreV1Api,
+    namespace: str,
+    rq_name: str,
+    increment: int,
+    key: str,
 ) -> None:
+    rq = v1.read_namespaced_resource_quota(rq_name, namespace)
+    hard = rq.spec.hard or {}
+    if key not in hard:
+        raise ValueError(f"ResourceQuota {namespace}/{rq_name} missing spec.hard['{key}']")
+    current = int(str(hard[key]))
+    new_val = str(current + increment)
+    body = {"spec": {"hard": {key: new_val}}}
+    v1.patch_namespaced_resource_quota(rq_name, namespace, body)
+
+
+# ----------------------------
+# Values render + Helm apply
+# ----------------------------
+
+def render_values_template(template_path: str, out_path: str, context: Dict[str, Any]) -> None:
     template_dir = os.path.dirname(os.path.abspath(template_path)) or "."
     template_file = os.path.basename(template_path)
 
     env = Environment(
         loader=FileSystemLoader(template_dir),
-        undefined=StrictUndefined,  # fail fast if template references missing var
+        undefined=StrictUndefined,
         autoescape=False,
         keep_trailing_newline=True,
     )
     tmpl = env.get_template(template_file)
     rendered = tmpl.render(**context)
 
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    ensure_dir(os.path.dirname(out_path))
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(rendered)
 
 
-# ----------------------------
-# Helm apply
-# ----------------------------
-
-def helm_upgrade_install(
-    release: str,
-    namespace: str,
-    chart: str,
-    values_file: str,
-) -> None:
+def helm_upgrade_install(release: str, namespace: str, chart: str, values_file: str) -> None:
     cmd = [
         "helm", "upgrade", "--install",
         release, chart,
@@ -274,7 +313,7 @@ def helm_upgrade_install(
         "-f", values_file,
         "--create-namespace",
     ]
-    cp = run(cmd, check=False)
+    cp = run(cmd)
     if cp.returncode != 0:
         raise RuntimeError(
             "helm failed\n"
@@ -284,196 +323,471 @@ def helm_upgrade_install(
         )
 
 
+# ----------------------------
+# Reporting
+# ----------------------------
+
+def format_results_table(results: List[TenantResult]) -> str:
+    headers = ["STATUS", "TENANT_FULL", "NAMESPACE", "RELEASE", "INGRESS_CLASS", "OLD_NP", "NEW_NP", "RQ", "VALUES", "REASON"]
+    rows = []
+    for r in results:
+        rows.append([
+            r.status,
+            r.tenant_full,
+            r.namespace,
+            r.release,
+            r.ingress_class,
+            "" if r.old_nodeport_https is None else str(r.old_nodeport_https),
+            "" if r.new_nodeport_https is None else str(r.new_nodeport_https),
+            "" if r.rq_name is None else r.rq_name,
+            "" if r.values_path is None else r.values_path,
+            "" if r.reason is None else r.reason,
+        ])
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(row: List[str]) -> str:
+        return " | ".join(cell.ljust(widths[i]) for i, cell in enumerate(row))
+
+    lines = [fmt_row(headers), "-+-".join("-" * w for w in widths)]
+    for row in rows:
+        lines.append(fmt_row(row))
+    return "\n".join(lines)
+
+
+def write_report_files(report: Report, out_dir: str, write_md: bool, write_json: bool):
+    ensure_dir(out_dir)
+    if write_json:
+        path = os.path.join(out_dir, "report.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(asdict(report), f, ensure_ascii=False, indent=2)
+
+    if write_md:
+        md_path = os.path.join(out_dir, "report.md")
+        lines = []
+        lines.append(f"# HAProxy Ingress Bulk Install Report")
+        lines.append("")
+        lines.append(f"- Started (UTC): `{report.started_at_utc}`")
+        lines.append(f"- Finished (UTC): `{report.finished_at_utc}`")
+        lines.append(f"- Dry run: `{report.dry_run}`")
+        lines.append("")
+        lines.append("## Infra validation")
+        lines.append("")
+        lines.append(f"- Selector: `{report.infra_selector}`")
+        lines.append(f"- CPU requests: `{report.infra_cpu_requests_m}m`")
+        lines.append(f"- CPU allocatable: `{report.infra_cpu_allocatable_m}m`")
+        lines.append(f"- Ratio: `{report.infra_cpu_ratio:.2%}`")
+        lines.append(f"- Threshold: `{report.infra_threshold:.2%}`")
+        lines.append(f"- PASS: `{report.infra_ok}`")
+        lines.append("")
+        if report.global_abort_reason:
+            lines.append("## GLOBAL ABORT")
+            lines.append("")
+            lines.append(f"Reason: `{report.global_abort_reason}`")
+            lines.append("")
+
+        lines.append("## NodePort collisions")
+        lines.append("")
+        if report.nodeport_collisions:
+            for c in report.nodeport_collisions:
+                lines.append(f"- NodePort `{c.nodeport}`")
+                lines.append(f"  - Planned tenants: `{', '.join(c.planned_tenants)}`")
+                lines.append(f"  - Existing services: `{', '.join(c.existing_services)}`")
+        else:
+            lines.append("- None")
+        lines.append("")
+        lines.append("## Results")
+        lines.append("")
+        lines.append("```text")
+        lines.append(format_results_table(report.results))
+        lines.append("```")
+        lines.append("")
+        lines.append("## Summary")
+        lines.append("")
+        lines.append(f"- Total: `{report.tenants_total}`")
+        lines.append(f"- Success: `{report.tenants_success}`")
+        lines.append(f"- Failed: `{report.tenants_failed}`")
+        lines.append(f"- Skipped: `{report.tenants_skipped}`")
+        lines.append("")
+
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+
+# ----------------------------
+# Main flow
+# ----------------------------
+
 def main():
-    ap = argparse.ArgumentParser(description="Bulk install HAProxy official ingress POC per Capsule tenant")
+    parser = argparse.ArgumentParser(description="Bulk install HAProxy ingress per Capsule tenant (config-driven)")
+    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml (default: config.yaml)")
+    args = parser.parse_args()
 
-    # Mode
-    ap.add_argument("--mode", choices=["cluster", "tenant"], required=True)
-    ap.add_argument("--tenant", help="Tenant CR name (full), e.g. t-25690968-foo, when --mode tenant")
-    ap.add_argument("--namespace", help="Override namespace when --mode tenant (optional)")
+    cfg = read_yaml_file(args.config)
 
-    # Capsule tenant CRD (for --mode cluster)
-    ap.add_argument("--capsule-group", default="capsule.clastix.io")
-    ap.add_argument("--capsule-version", default="v1beta1")
-    ap.add_argument("--capsule-plural", default="tenants")
+    # Config fields
+    cap_group = must_get(cfg, "capsule.group")
+    cap_version = must_get(cfg, "capsule.version")
+    cap_plural = must_get(cfg, "capsule.plural")
 
-    # Tenant naming
-    ap.add_argument(
-        "--tenant-name-regex",
-        default=r"^t-(\d+)-(.+)$",
-        help=r"Regex with 2 capture groups: userid and tenant_short. Default: ^t-(\d+)-(.+)$",
-    )
+    tenant_regex = must_get(cfg, "tenant_naming.regex")
+    ns_suffix = must_get(cfg, "tenant_naming.ingress_namespace_suffix")
 
-    # Namespace convention (you confirmed tenant_full)
-    ap.add_argument("--ns-suffix", default="-ingress", help="Ingress namespace suffix, default: -ingress")
-    ap.add_argument(
-        "--ns-from",
-        choices=["full", "short"],
-        default="full",
-        help="Namespace base derived from tenant_full or tenant_short. Default: full",
-    )
+    nginx_svc = must_get(cfg, "old_nginx.service_name")
+    nginx_dep = must_get(cfg, "old_nginx.deployment_name")
+    https_port_name = must_get(cfg, "old_nginx.https_port_name")
+    require_single_nodeport = bool(must_get(cfg, "old_nginx.require_single_nodeport"))
 
-    # Naming conventions
-    ap.add_argument(
-        "--ingress-class-pattern",
-        default="{tenant_short}-haproxy",
-        help="IngressClass pattern supports {tenant_full},{tenant_short},{userid}",
-    )
-    ap.add_argument(
-        "--release-pattern",
-        default="haproxy-ingress-poc-{tenant_short}",
-        help="Release name pattern supports {tenant_full},{tenant_short},{userid}",
-    )
+    np_offset = int(must_get(cfg, "nodeport.offset"))
 
-    # Old NGINX (k8s community inc)
-    ap.add_argument("--nginx-svc", default="xxx-ingress-nginx-controller", help="Old nginx controller Service name")
-    ap.add_argument("--nginx-deploy", default="xxxx-inc1-ingress-nginx-controller", help="Old nginx controller Deployment name")
+    rq_template = must_get(cfg, "resourcequota.name_template")
+    rq_key = must_get(cfg, "resourcequota.hard_key")
+    rq_inc = int(must_get(cfg, "resourcequota.increment"))
 
-    # HAProxy official chart
-    ap.add_argument("--chart", required=True, help="HAProxy official chart (path or repo/chart)")
+    infra_selector = must_get(cfg, "infra.node_selector")
+    infra_threshold = float(must_get(cfg, "infra.cpu_requests_ratio_threshold"))
 
-    # Values template and output
-    ap.add_argument("--values-template", required=True, help="Jinja2 values template file, e.g. values-template.yaml.j2")
-    ap.add_argument("--values-out-dir", required=True, help="Directory to write per-tenant values.yaml")
+    chart = must_get(cfg, "haproxy.chart")
+    values_template = must_get(cfg, "haproxy.values_template")
+    values_out_dir = must_get(cfg, "haproxy.values_output_dir")
 
-    # Quota patching
-    ap.add_argument(
-        "--rq-template",
-        default="capsule-t-{userid}-{tenant_short}-0",
-        help="ResourceQuota name template supports {userid},{tenant_short},{tenant_full}. Default: capsule-t-{userid}-{tenant_short}-0",
-    )
-    ap.add_argument("--rq-key", default="services.nodeports", help="ResourceQuota hard key to increment")
+    release_pattern = must_get(cfg, "naming.release_pattern")
+    ingress_class_pattern = must_get(cfg, "naming.ingress_class_pattern")
 
-    # Infra capacity check
-    ap.add_argument("--infra-selector", default="infra_node=true", help="Infra node label selector, e.g. infra_node=true")
-    ap.add_argument("--cpu-threshold", type=float, default=0.90, help="Abort if infra cpu requests ratio >= threshold")
+    dry_run = bool(must_get(cfg, "execution.dry_run"))
+    continue_on_error = bool(must_get(cfg, "execution.continue_on_error"))
 
-    # Behavior
-    ap.add_argument("--dry-run", action="store_true", help="Do not patch quota and do not run helm")
-    ap.add_argument("--continue-on-error", action="store_true", help="Continue processing tenants after failures")
+    report_out_dir = must_get(cfg, "report.out_dir")
+    write_md = bool(get(cfg, "report.write_md", True))
+    write_json = bool(get(cfg, "report.write_json", True))
 
-    args = ap.parse_args()
+    started = utc_now_iso()
 
     load_kube()
     v1 = client.CoreV1Api()
     apps = client.AppsV1Api()
     custom = client.CustomObjectsApi()
 
-    ratio, req_m, alloc_m = infra_cpu_request_ratio(v1, args.infra_selector)
-    print(f"[PRECHECK] Infra CPU requests: {req_m}m / {alloc_m}m = {ratio:.2%}")
-    if ratio >= args.cpu_threshold:
-        print("[ABORT] Infra cpu requests too high; refusing to deploy.", file=sys.stderr)
+    # --- Global validation #1: infra capacity ---
+    global_abort_reason: Optional[str] = None
+    try:
+        infra_ratio, infra_req_m, infra_alloc_m = infra_cpu_request_ratio(v1, infra_selector)
+        infra_ok = infra_ratio < infra_threshold
+    except Exception as e:
+        infra_ratio, infra_req_m, infra_alloc_m = 1.0, 0, 0
+        infra_ok = False
+        global_abort_reason = f"Infra validation error: {e}"
+
+    if not infra_ok and not global_abort_reason:
+        global_abort_reason = (
+            f"Infra CPU requests ratio too high: {infra_ratio:.2%} >= {infra_threshold:.2%} (selector={infra_selector})"
+        )
+
+    # Discover tenants (tenant_full is the Capsule tenant name)
+    tenant_full_list = list_capsule_tenant_names(custom, cap_group, cap_version, cap_plural)
+
+    identities: List[TenantIdentity] = []
+    results: List[TenantResult] = []
+    nodeport_collisions: List[NodePortCollision] = []
+
+    # Parse identities early (so we can report parse failures cleanly)
+    for tfull in tenant_full_list:
+        try:
+            ident = parse_tenant_identity(tfull, tenant_regex, ns_suffix)
+            identities.append(ident)
+        except Exception as e:
+            results.append(
+                TenantResult(
+                    tenant_full=tfull,
+                    tenant_short="",
+                    userid="",
+                    namespace="",
+                    release="",
+                    ingress_class="",
+                    status="FAILED",
+                    reason=f"Tenant name parse failed: {e}",
+                )
+            )
+            if not continue_on_error:
+                global_abort_reason = global_abort_reason or "Stopped due to tenant parse failure and continue_on_error=false"
+                break
+
+    # If infra not OK => mark all remaining as SKIPPED, write report, exit
+    if global_abort_reason:
+        # Mark any tenants that haven't already been recorded
+        recorded = {r.tenant_full for r in results if r.tenant_full}
+        for ident in identities:
+            if ident.tenant_full in recorded:
+                continue
+            release = release_pattern.format(tenant_full=ident.tenant_full, tenant_short=ident.tenant_short, userid=ident.userid)
+            ingress_class = ingress_class_pattern.format(tenant_full=ident.tenant_full, tenant_short=ident.tenant_short, userid=ident.userid)
+            results.append(
+                TenantResult(
+                    tenant_full=ident.tenant_full,
+                    tenant_short=ident.tenant_short,
+                    userid=ident.userid,
+                    namespace=ident.namespace,
+                    release=release,
+                    ingress_class=ingress_class,
+                    status="SKIPPED",
+                    reason=global_abort_reason,
+                )
+            )
+
+        finished = utc_now_iso()
+        rep = Report(
+            started_at_utc=started,
+            finished_at_utc=finished,
+            dry_run=dry_run,
+            infra_selector=infra_selector,
+            infra_cpu_requests_m=infra_req_m,
+            infra_cpu_allocatable_m=infra_alloc_m,
+            infra_cpu_ratio=infra_ratio,
+            infra_threshold=infra_threshold,
+            infra_ok=False,
+            tenants_total=len(results),
+            tenants_success=sum(1 for r in results if r.status == "SUCCESS"),
+            tenants_failed=sum(1 for r in results if r.status == "FAILED"),
+            tenants_skipped=sum(1 for r in results if r.status == "SKIPPED"),
+            global_abort_reason=global_abort_reason,
+            nodeport_collisions=[],
+            results=results,
+        )
+        print("\n[GLOBAL ABORT]")
+        print(global_abort_reason)
+        print("\n[RESULTS]\n")
+        print(format_results_table(rep.results))
+        write_report_files(rep, report_out_dir, write_md, write_json)
         sys.exit(2)
 
-    # Determine tenant CR names
-    if args.mode == "cluster":
-        tenant_full_names = list_capsule_tenants(custom, args.capsule_group, args.capsule_version, args.capsule_plural)
-        if not tenant_full_names:
-            print("[WARN] No tenants found from Capsule CRs.")
-    else:
-        if not args.tenant:
-            print("[ERROR] --tenant is required when --mode tenant", file=sys.stderr)
-            sys.exit(2)
-        tenant_full_names = [args.tenant]
+    # --- Phase A: Build plan (read old nodePort per tenant) ---
+    plan: Dict[str, Dict[str, Any]] = {}  # tenant_full -> planned data
+    for ident in identities:
+        release = release_pattern.format(tenant_full=ident.tenant_full, tenant_short=ident.tenant_short, userid=ident.userid)
+        ingress_class = ingress_class_pattern.format(tenant_full=ident.tenant_full, tenant_short=ident.tenant_short, userid=ident.userid)
+        rq_name = rq_template.format(userid=ident.userid, tenant_short=ident.tenant_short, tenant_full=ident.tenant_full)
 
-    plans: List[TenantPlan] = []
-    failures = 0
-
-    for tenant_full in tenant_full_names:
-        try:
-            ident = parse_tenant_identity(tenant_full, args.tenant_name_regex)
-        except Exception as e:
-            failures += 1
-            print(f"[FAIL] tenant_full={tenant_full}: cannot parse identity: {e}", file=sys.stderr)
-            if not args.continue_on_error:
-                break
-            continue
-
-        ns = args.namespace if (args.mode == "tenant" and args.namespace) else tenant_to_ingress_namespace(ident, args.ns_suffix, args.ns_from)
-        release = derive_release_name(args.release_pattern, ident)
-        ingress_class = derive_ingress_class(args.ingress_class_pattern, ident)
-        rq_name = args.rq_template.format(userid=ident.userid, tenant_short=ident.tenant_short, tenant_full=ident.tenant_full)
-
-        plan = TenantPlan(
+        tr = TenantResult(
             tenant_full=ident.tenant_full,
             tenant_short=ident.tenant_short,
             userid=ident.userid,
-            namespace=ns,
+            namespace=ident.namespace,
             release=release,
-            old_nodeport_https=-1,
-            new_nodeport_https=-1,
             ingress_class=ingress_class,
-            passthrough=False,
             rq_name=rq_name,
-            rq_patched=False,
-            values_path="",
-            helm_applied=False,
         )
 
         try:
-            old_np = get_https_single_nodeport_or_raise(v1, ns, args.nginx_svc)
-            new_np = old_np + 1000
+            old_np = get_https_nodeport_strict(
+                v1=v1,
+                namespace=ident.namespace,
+                svc_name=nginx_svc,
+                https_port_name=https_port_name,
+                require_single_nodeport=require_single_nodeport,
+            )
+            new_np = old_np + np_offset
 
-            plan.old_nodeport_https = old_np
-            plan.new_nodeport_https = new_np
-
-            if nodeport_in_use(v1, new_np):
-                plan.skipped_reason = f"new nodePort {new_np} already in use in cluster"
-                print(f"[SKIP] tenant_full={ident.tenant_full} ns={ns}: {plan.skipped_reason}")
-                plans.append(plan)
-                continue
+            tr.old_nodeport_https = old_np
+            tr.new_nodeport_https = new_np
 
             try:
-                plan.passthrough = detect_passthrough_from_deployment_args(apps, ns, args.nginx_deploy)
-            except ApiException as e:
-                print(f"[WARN] tenant_full={ident.tenant_full} ns={ns}: cannot read nginx deployment {args.nginx_deploy}: {e}")
-                plan.passthrough = False
+                tr.passthrough = detect_passthrough_from_deployment_args(apps, ident.namespace, nginx_dep)
+            except ApiException:
+                tr.passthrough = False  # best-effort
 
-            if not args.dry_run:
-                plan.rq_patched = patch_resourcequota_nodeports(v1, ns, rq_name, increment=1, key=args.rq_key)
+            plan[ident.tenant_full] = {
+                "ident": ident,
+                "result": tr,
+                "old_np": old_np,
+                "new_np": new_np,
+                "release": release,
+                "ingress_class": ingress_class,
+                "rq_name": rq_name,
+            }
+        except Exception as e:
+            tr.status = "FAILED"
+            tr.reason = f"Plan build failed (cannot read old nginx nodePort): {e}"
+            results.append(tr)
+            if not continue_on_error:
+                break
 
-            out_file = os.path.join(args.values_out_dir, ident.tenant_full, "values.yaml")
+    # If we already have failures and continue_on_error==False => stop before any change
+    if any(r.status == "FAILED" for r in results) and not continue_on_error:
+        finished = utc_now_iso()
+        rep = Report(
+            started_at_utc=started,
+            finished_at_utc=finished,
+            dry_run=dry_run,
+            infra_selector=infra_selector,
+            infra_cpu_requests_m=infra_req_m,
+            infra_cpu_allocatable_m=infra_alloc_m,
+            infra_cpu_ratio=infra_ratio,
+            infra_threshold=infra_threshold,
+            infra_ok=True,
+            tenants_total=len(results),
+            tenants_success=0,
+            tenants_failed=sum(1 for r in results if r.status == "FAILED"),
+            tenants_skipped=sum(1 for r in results if r.status == "SKIPPED"),
+            global_abort_reason="Stopped due to tenant failure and continue_on_error=false (no changes applied).",
+            nodeport_collisions=[],
+            results=results,
+        )
+        print("\n[GLOBAL ABORT]\nStopped due to failures during planning and continue_on_error=false")
+        print("\n[RESULTS]\n")
+        print(format_results_table(rep.results))
+        write_report_files(rep, report_out_dir, write_md, write_json)
+        sys.exit(2)
+
+    # --- Global validation #2: NodePort conflicts (ALL tenants, before any patch/helm) ---
+    # Build nodeport -> planned tenants list
+    planned_np_map: Dict[int, List[str]] = {}
+    for tfull, p in plan.items():
+        planned_np_map.setdefault(int(p["new_np"]), []).append(tfull)
+
+    nodeport_index = build_nodeport_index(v1)
+
+    collisions: List[NodePortCollision] = []
+    for np, tlist in sorted(planned_np_map.items(), key=lambda x: x[0]):
+        existing = nodeport_index.get(np, [])
+        if existing:
+            collisions.append(NodePortCollision(nodeport=np, planned_tenants=sorted(tlist), existing_services=sorted(existing)))
+
+    if collisions:
+        global_abort_reason = "NodePort collision detected; no changes applied."
+        nodeport_collisions = collisions
+
+        # Mark planned tenants as SKIPPED due to collision
+        for tfull, p in plan.items():
+            tr: TenantResult = p["result"]
+            tr.status = "SKIPPED"
+            tr.reason = f"{global_abort_reason} Planned nodePort={p['new_np']} is already used by: {', '.join(nodeport_index.get(int(p['new_np']), []))}"
+            results.append(tr)
+
+        finished = utc_now_iso()
+        rep = Report(
+            started_at_utc=started,
+            finished_at_utc=finished,
+            dry_run=dry_run,
+            infra_selector=infra_selector,
+            infra_cpu_requests_m=infra_req_m,
+            infra_cpu_allocatable_m=infra_alloc_m,
+            infra_cpu_ratio=infra_ratio,
+            infra_threshold=infra_threshold,
+            infra_ok=True,
+            tenants_total=len(results),
+            tenants_success=sum(1 for r in results if r.status == "SUCCESS"),
+            tenants_failed=sum(1 for r in results if r.status == "FAILED"),
+            tenants_skipped=sum(1 for r in results if r.status == "SKIPPED"),
+            global_abort_reason=global_abort_reason,
+            nodeport_collisions=nodeport_collisions,
+            results=results,
+        )
+
+        print("\n[GLOBAL ABORT]")
+        print(global_abort_reason)
+        print("\n[COLLISIONS]")
+        for c in collisions:
+            print(f"- NodePort {c.nodeport}: planned={c.planned_tenants} existing={c.existing_services}")
+        print("\n[RESULTS]\n")
+        print(format_results_table(rep.results))
+        write_report_files(rep, report_out_dir, write_md, write_json)
+        sys.exit(2)
+
+    # --- Execution phase (patch quota, render values, helm) ---
+    for tfull, p in plan.items():
+        tr: TenantResult = p["result"]
+        ident: TenantIdentity = p["ident"]
+
+        try:
+            # values per tenant
+            out_file = os.path.join(values_out_dir, ident.tenant_full, "values.yaml")
             ctx = {
                 "tenant_full": ident.tenant_full,
                 "tenant_short": ident.tenant_short,
-                "tenant": ident.tenant_short,   # alias
-                "namespace": ns,
+                "tenant": ident.tenant_short,
+                "namespace": ident.namespace,
                 "userid": ident.userid,
-                "release": release,
-                "ingress_class": ingress_class,
-                "nodeport_https": new_np,
-                "passthrough": plan.passthrough,
-                "old_nodeport_https": old_np,
-                "chart": args.chart,
+                "release": p["release"],
+                "ingress_class": p["ingress_class"],
+                "old_nodeport_https": p["old_np"],
+                "nodeport_https": p["new_np"],
+                "passthrough": bool(tr.passthrough),
+                "chart": chart,
             }
-            render_values_template(args.values_template, out_file, ctx)
-            plan.values_path = out_file
 
-            if not args.dry_run:
-                helm_upgrade_install(release, ns, args.chart, out_file)
-                plan.helm_applied = True
+            if not dry_run:
+                patch_resourcequota_nodeports(
+                    v1=v1,
+                    namespace=ident.namespace,
+                    rq_name=p["rq_name"],
+                    increment=rq_inc,
+                    key=rq_key,
+                )
+                tr.rq_patched = True
 
-            print(
-                f"[OK] tenant_full={ident.tenant_full} userid={ident.userid} tenant_short={ident.tenant_short} "
-                f"ns={ns} (from tenant_full) release={release} oldNP={old_np} newNP={new_np} "
-                f"class={ingress_class} passthrough={plan.passthrough} rq={rq_name} "
-                f"rqPatched={plan.rq_patched} values={out_file} helm={plan.helm_applied}"
-            )
-            plans.append(plan)
+            render_values_template(values_template, out_file, ctx)
+            tr.values_path = out_file
+
+            if not dry_run:
+                helm_upgrade_install(p["release"], ident.namespace, chart, out_file)
+                tr.helm_applied = True
+
+            tr.status = "SUCCESS"
+            tr.reason = "OK" if not dry_run else "OK (dry-run: no quota patch, no helm)"
+            results.append(tr)
 
         except Exception as e:
-            failures += 1
-            plan.skipped_reason = str(e)
-            plans.append(plan)
-            print(f"[FAIL] tenant_full={ident.tenant_full} ns={ns}: {e}", file=sys.stderr)
-            if not args.continue_on_error:
+            tr.status = "FAILED"
+            tr.reason = str(e)
+            results.append(tr)
+            if not continue_on_error:
                 break
 
-    ok = sum(1 for p in plans if p.helm_applied or (args.dry_run and not p.skipped_reason))
-    skipped = sum(1 for p in plans if p.skipped_reason and not p.helm_applied)
-    print(f"\n[SUMMARY] tenants_total={len(plans)} ok={ok} skipped_or_failed={skipped} failures={failures}")
-    if failures and not args.continue_on_error:
+    finished = utc_now_iso()
+    rep = Report(
+        started_at_utc=started,
+        finished_at_utc=finished,
+        dry_run=dry_run,
+        infra_selector=infra_selector,
+        infra_cpu_requests_m=infra_req_m,
+        infra_cpu_allocatable_m=infra_alloc_m,
+        infra_cpu_ratio=infra_ratio,
+        infra_threshold=infra_threshold,
+        infra_ok=True,
+        tenants_total=len(results),
+        tenants_success=sum(1 for r in results if r.status == "SUCCESS"),
+        tenants_failed=sum(1 for r in results if r.status == "FAILED"),
+        tenants_skipped=sum(1 for r in results if r.status == "SKIPPED"),
+        global_abort_reason=None,
+        nodeport_collisions=[],
+        results=results,
+    )
+
+    # Console output (detailed & readable)
+    print("\n[VALIDATION]")
+    print(f"- Infra selector: {infra_selector}")
+    print(f"- Infra CPU: {infra_req_m}m / {infra_alloc_m}m = {infra_ratio:.2%} (threshold {infra_threshold:.2%})")
+    print("- NodePort collision: NONE (global check passed)")
+
+    print("\n[RESULTS]\n")
+    print(format_results_table(rep.results))
+
+    print("\n[SUMMARY]")
+    print(f"- Total:   {rep.tenants_total}")
+    print(f"- Success: {rep.tenants_success}")
+    print(f"- Failed:  {rep.tenants_failed}")
+    print(f"- Skipped: {rep.tenants_skipped}")
+    print(f"- Report:  {os.path.abspath(report_out_dir)}/report.md , report.json")
+
+    write_report_files(rep, report_out_dir, write_md, write_json)
+
+    # Exit code
+    if rep.tenants_failed > 0:
         sys.exit(1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
