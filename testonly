@@ -1,3 +1,23 @@
+def namespace_has_haproxy_by_helm(ns: str) -> tuple[bool, str]:
+    """
+    判断该 namespace 是否已经安装过 HAProxy Ingress（chart 名包含 kubernetes-ingress）
+    返回: (True/False, reason)
+    """
+    out = run(["helm", "-n", ns, "list", "-o", "json"], capture=True, check=True)
+    rels = json.loads(out) if out else []
+ 
+    for r in rels:
+        chart = (r.get("chart") or "").lower()  # e.g. "kubernetes-ingress-1.42.0"
+        name = (r.get("name") or "").strip()
+        if "kubernetes-ingress" in chart:
+            return True, f"found haproxy helm release '{name}' chart='{r.get('chart')}'"
+ 
+    return False, "no kubernetes-ingress helm release"
+has_hp, reason = namespace_has_haproxy_by_helm(namespace)
+if has_hp:
+    print(f"[skip] {namespace}: {reason}")
+    continue
+
 11111
 # ============================================================
 # HAProxy Ingress Controller Migration Configuration
