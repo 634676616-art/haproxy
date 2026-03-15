@@ -1,4 +1,49 @@
-        # 2) Bump Capsule Tenant quota: services.nodeports (+1)
+        # Gate: skip namespaces with >1 NodePort ports (manual handling)
+        np_port_count, np_details = count_nodeport_ports_in_namespace(cfg, tenant.namespace)
+        if np_port_count > 1:
+            detail_str = "; ".join(
+                f"{d['service']}:{d.get('port_name','')} nodePort={d['nodePort']}"
+                for d in np_details
+            )
+            raise TenantSkip(
+                f"namespace {tenant.namespace} has {np_port_count} NodePort ports (>1); "
+                f"skip for manual handling. Details: {detail_str}"
+            )
+ 
+
+def count_nodeport_ports_in_namespace(cfg: dict, namespace: str) -> tuple[int, list[dict[str, Any]]]:
+    """
+    Count total number of NodePort ports in the namespace across all Services.
+ 
+    Returns:
+      (count, details)
+      - count: total number of ports where .spec.ports[].nodePort is set
+      - details: list of {service, port_name, port, targetPort, protocol, nodePort}
+    """
+    res = kubectl(["get", "svc", "-n", namespace, "-o", "json"], cfg)
+    obj = json.loads(res.stdout)
+ 
+    details: list[dict[str, Any]] = []
+    for svc in obj.get("items", []):
+        svc_name = svc.get("metadata", {}).get("name", "")
+        ports = svc.get("spec", {}).get("ports", []) or []
+        for p in ports:
+            np = p.get("nodePort")
+            if np:
+                details.append(
+                    {
+                        "service": f"{namespace}/{svc_name}",
+                        "port_name": p.get("name", ""),
+                        "port": p.get("port"),
+                        "targetPort": p.get("targetPort"),
+                        "protocol": p.get("protocol", ""),
+                        "nodePort": np,
+                    }
+                )
+ 
+    return len(details), details
+
+# 2) Bump Capsule Tenant quota: services.nodeports (+1)
         old_npq = new_npq = None
         try:
             old_npq, new_npq = bump_tenant_services_nodeports(
