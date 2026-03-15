@@ -1,3 +1,89 @@
+        # 2) Bump Capsule Tenant quota: services.nodeports (+1)
+        old_npq = new_npq = None
+        try:
+            old_npq, new_npq = bump_tenant_services_nodeports(
+                cfg,
+                tenant_name=tenant.tenant_full,
+                delta=1,
+                dry_run=False,
+            )
+            log.info(
+                "  [CapsuleQuota] %s services.nodeports: %s -> %s",
+                tenant.tenant_full, old_npq, new_npq,
+            )
+ 
+            # 3) Helm deploy (may create/replace NodePort Service)
+            release = deploy_tenant(cfg, tenant, values_file)
+            result.helm_release = release
+ 
+        except Exception:
+            # Best-effort rollback to avoid leaving quota bumped on failure
+            if old_npq is not None:
+                try:
+                    # rollback by setting it back to old (still JSONPatch single field)
+                    patch_ops = [
+                        {"op": "replace", "path": "/spec/resourceQuotas/items/0/hard/services.nodeports", "value": str(old_npq)},
+                    ]
+                    kubectl(
+                        ["patch", "tenant", tenant.tenant_full, "--type=json", "-p", json.dumps(patch_ops)],
+                        cfg,
+                    )
+                    log.warning(
+                        "  [CapsuleQuota] Rolled back %s services.nodeports to %s",
+                        tenant.tenant_full, old_npq,
+                    )
+                except Exception as re:
+                    log.error(
+                        "  [CapsuleQuota] Rollback FAILED for %s: %s",
+                        tenant.tenant_full, re,
+                        exc_info=True,
+                    )
+            raise
+
+def bump_tenant_services_nodeports(cfg: dict, tenant_name: str, delta: int = 1, dry_run: bool = False) -> tuple[int, int]:
+    """
+    Safely bump Capsule Tenant spec.resourceQuotas.items[0].hard["services.nodeports"] by delta.
+ 
+    Safety properties:
+    - Uses JSONPatch to touch ONLY that single key (won't overwrite other hard keys).
+    - Includes a 'test' op so it will fail if the value changed between read and patch.
+    """
+    # Read current tenant
+    res = kubectl(["get", "tenant", tenant_name, "-o", "json"], cfg)
+    obj = json.loads(res.stdout)
+ 
+    try:
+        cur_raw = obj["spec"]["resourceQuotas"]["items"][0]["hard"]["services.nodeports"]
+    except Exception as e:
+        raise TenantSkip(
+            f"Tenant {tenant_name}: missing spec.resourceQuotas.items[0].hard['services.nodeports']"
+        ) from e
+ 
+    try:
+        cur = int(str(cur_raw).strip())
+    except Exception as e:
+        raise TenantSkip(
+            f"Tenant {tenant_name}: services.nodeports is not int-like: {cur_raw!r}"
+        ) from e
+ 
+    new = cur + int(delta)
+ 
+    patch_ops = [
+        {"op": "test", "path": "/spec/resourceQuotas/items/0/hard/services.nodeports", "value": str(cur)},
+        {"op": "replace", "path": "/spec/resourceQuotas/items/0/hard/services.nodeports", "value": str(new)},
+    ]
+ 
+    args = [
+        "patch", "tenant", tenant_name,
+        "--type=json",
+        "-p", json.dumps(patch_ops),
+    ]
+    if dry_run:
+        args += ["--dry-run=server", "-o", "yaml"]
+ 
+    kubectl(args, cfg)
+    return cur, new
+
 def namespace_has_haproxy_by_helm(cfg: dict, namespace: str) -> tuple[bool, str]:
     """
     True 表示该 namespace 已存在 HAProxy Ingress（chart 名包含 kubernetes-ingress）
