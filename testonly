@@ -1,18 +1,22 @@
-def namespace_has_haproxy_by_helm(ns: str) -> tuple[bool, str]:
+def namespace_has_haproxy_by_helm(cfg: dict, namespace: str) -> tuple[bool, str]:
     """
-    判断该 namespace 是否已经安装过 HAProxy Ingress（chart 名包含 kubernetes-ingress）
-    返回: (True/False, reason)
+    True 表示该 namespace 已存在 HAProxy Ingress（chart 名包含 kubernetes-ingress）
     """
-    out = run(["helm", "-n", ns, "list", "-o", "json"], capture=True, check=True)
-    rels = json.loads(out) if out else []
+    ctx = deep_get(cfg, "cluster.context", "")
+    args = ["list", "-n", namespace, "-o", "json"]
+    if ctx:
+        args += ["--kube-context", ctx]
+ 
+    res = helm(args, capture=True, check=True)
+    rels = json.loads(res.stdout) if res.stdout.strip() else []
  
     for r in rels:
         chart = (r.get("chart") or "").lower()  # e.g. "kubernetes-ingress-1.42.0"
         name = (r.get("name") or "").strip()
         if "kubernetes-ingress" in chart:
-            return True, f"found haproxy helm release '{name}' chart='{r.get('chart')}'"
+            return True, f"found release={name} chart={r.get('chart')}"
+    return False, "not found"
  
-    return False, "no kubernetes-ingress helm release"
 has_hp, reason = namespace_has_haproxy_by_helm(namespace)
 if has_hp:
     print(f"[skip] {namespace}: {reason}")
