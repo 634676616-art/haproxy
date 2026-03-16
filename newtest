@@ -1,0 +1,979 @@
+#!/usr/bin/env python3
+"""
+HAProxy Ingress Controller Migration Script
+Migrates from community NGINX Ingress Controller to
+HAProxy Technologies Ingress Controller.
+
+Requirements:
+    pip install pyyaml jinja2
+    helm, kubectl must be in PATH
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import yaml
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger("haproxy-migrate")
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+class MigrationAbort(RuntimeError):
+    """Fatal: abort entire migration."""
+
+
+class TenantSkip(RuntimeError):
+    """Non-fatal: skip a single tenant."""
+
+
+# ---------------------------------------------------------------------------
+# Data Models
+# ---------------------------------------------------------------------------
+@dataclass
+class TenantInfo:
+    tenant_full: str          # t-25690968-foo-ingress
+    namespace: str            # same as tenant_full (Capsule convention)
+    user_id: str              # 25690968
+    tenant_short: str         # foo
+    ingress_class: str        # haproxy-foo
+    old_nodeport_https: int
+    new_nodeport_https: int
+
+
+@dataclass
+class TenantResult:
+    tenant_full: str
+    status: str               # success | failed | skipped
+    ingress_class: str = ""
+    nodeport_https: int = 0
+    reason: str = ""
+    helm_release: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Config Helpers
+# ---------------------------------------------------------------------------
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    return cfg
+
+
+def must_get(cfg: dict, dotpath: str) -> Any:
+    parts = dotpath.split(".")
+    cur = cfg
+    for p in parts:
+        if not isinstance(cur, dict) or p not in cur:
+            raise MigrationAbort(f"Missing required config key: {dotpath}")
+        cur = cur[p]
+    return cur
+
+
+def deep_get(cfg: dict, dotpath: str, default=None) -> Any:
+    try:
+        return must_get(cfg, dotpath)
+    except MigrationAbort:
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Shell Helpers
+# ---------------------------------------------------------------------------
+def run(
+    cmd: list[str],
+    capture: bool = True,
+    check: bool = True,
+) -> subprocess.CompletedProcess:
+    log.debug("RUN: %s", " ".join(cmd))
+    return subprocess.run(
+        cmd,
+        capture_output=capture,
+        text=True,
+        check=check,
+    )
+
+
+def kubectl(args: list[str], cfg: dict, **kwargs) -> subprocess.CompletedProcess:
+    ctx = deep_get(cfg, "cluster.context", "")
+    cmd = ["kubectl"] + args
+    if ctx:
+        cmd = ["kubectl", "--context", ctx] + args
+    return run(cmd, **kwargs)
+
+
+def helm(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return run(["helm"] + args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight: infra node CPU check
+# ---------------------------------------------------------------------------
+def check_infra_cpu(cfg: dict) -> None:
+    """
+    Abort migration if any infra node CPU requests ratio exceeds threshold.
+    """
+    threshold = must_get(cfg, "cluster.infra_cpu_threshold")
+    selector = must_get(cfg, "cluster.infra_node_selector")
+    log.info(
+        "[PreCheck] Checking infra node CPU requests ratio (threshold=%.0f%%)...",
+        threshold * 100,
+    )
+
+    res = kubectl(
+        ["get", "nodes", "-l", selector, "-o",
+         "jsonpath={.items[*].metadata.name}"],
+        cfg,
+    )
+    nodes = res.stdout.strip().split()
+    if not nodes:
+        raise MigrationAbort(f"No infra nodes found with selector: {selector}")
+
+    violations = []
+    for node in nodes:
+        res_alloc = kubectl(
+            ["get", "node", node, "-o",
+             "jsonpath={.status.allocatable.cpu}"],
+            cfg,
+        )
+        allocatable_m = _parse_cpu_to_milli(res_alloc.stdout.strip())
+
+        res_pods = kubectl(
+            ["get", "pods", "--all-namespaces",
+             "--field-selector", f"spec.nodeName={node}",
+             "-o",
+             "jsonpath={.items[*].spec.containers[*].resources.requests.cpu}"],
+            cfg,
+        )
+        total_req_m = sum(
+            _parse_cpu_to_milli(x)
+            for x in res_pods.stdout.strip().split()
+            if x
+        )
+
+        ratio = total_req_m / allocatable_m if allocatable_m > 0 else 0.0
+        log.info("  Node %-40s CPU requests ratio: %.1f%%", node, ratio * 100)
+        if ratio > threshold:
+            violations.append((node, ratio))
+
+    if violations:
+        lines = "\n".join(f"  - {n}: {r:.1%}" for n, r in violations)
+        raise MigrationAbort(
+            f"[ABORT] Infra node CPU requests ratio exceeds {threshold:.0%} "
+            f"threshold:\n{lines}\nResolve capacity before migrating."
+        )
+
+    log.info("[PreCheck] Infra CPU check PASSED.")
+
+
+def _parse_cpu_to_milli(raw: str) -> int:
+    raw = raw.strip()
+    if not raw:
+        return 0
+    if raw.endswith("m"):
+        return int(raw[:-1])
+    try:
+        return int(float(raw) * 1000)
+    except ValueError:
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight: NodePort conflict check
+# ---------------------------------------------------------------------------
+def check_nodeport_conflicts(cfg: dict, infos: list[TenantInfo]) -> None:
+    """
+    Ensure no two tenants will end up on the same new NodePort.
+    """
+    seen: dict[int, str] = {}
+    conflicts = []
+    for t in infos:
+        if t.new_nodeport_https in seen:
+            conflicts.append(
+                f"  {t.tenant_full} and {seen[t.new_nodeport_https]} "
+                f"both map to NodePort {t.new_nodeport_https}"
+            )
+        else:
+            seen[t.new_nodeport_https] = t.tenant_full
+
+    if conflicts:
+        raise MigrationAbort(
+            "[ABORT] NodePort conflicts detected:\n" + "\n".join(conflicts)
+        )
+
+    log.info("[PreCheck] NodePort conflict check PASSED.")
+
+
+# ---------------------------------------------------------------------------
+# NodePort helpers
+# ---------------------------------------------------------------------------
+def count_nodeport_ports_in_namespace(
+    cfg: dict, namespace: str
+) -> tuple[int, list[dict[str, Any]]]:
+    """
+    Count total NodePort ports in the namespace across all Services.
+    Returns (count, details).
+    """
+    res = kubectl(["get", "svc", "-n", namespace, "-o", "json"], cfg)
+    obj = json.loads(res.stdout)
+
+    details: list[dict[str, Any]] = []
+    for svc in obj.get("items", []):
+        svc_name = svc.get("metadata", {}).get("name", "")
+        ports = svc.get("spec", {}).get("ports", []) or []
+        for p in ports:
+            np = p.get("nodePort")
+            if np:
+                details.append(
+                    {
+                        "service": f"{namespace}/{svc_name}",
+                        "port_name": p.get("name", ""),
+                        "port": p.get("port"),
+                        "targetPort": p.get("targetPort"),
+                        "protocol": p.get("protocol", ""),
+                        "nodePort": np,
+                    }
+                )
+
+    return len(details), details
+
+
+def bump_tenant_services_nodeports(
+    cfg: dict,
+    tenant_name: str,
+    delta: int = 1,
+    dry_run: bool = False,
+) -> tuple[int, int]:
+    """
+    Safely bump Capsule Tenant spec.resourceQuotas.items[0].hard["services.nodeports"]
+    by delta. Uses JSONPatch test+replace for optimistic concurrency safety.
+    """
+    res = kubectl(["get", "tenant", tenant_name, "-o", "json"], cfg)
+    obj = json.loads(res.stdout)
+
+    try:
+        cur_raw = obj["spec"]["resourceQuotas"]["items"][0]["hard"][
+            "services.nodeports"
+        ]
+    except Exception as e:
+        raise TenantSkip(
+            f"Tenant {tenant_name}: missing "
+            f"spec.resourceQuotas.items[0].hard['services.nodeports']"
+        ) from e
+
+    try:
+        cur = int(str(cur_raw).strip())
+    except Exception as e:
+        raise TenantSkip(
+            f"Tenant {tenant_name}: services.nodeports is not int-like: {cur_raw!r}"
+        ) from e
+
+    new = cur + int(delta)
+
+    patch_ops = [
+        {
+            "op": "test",
+            "path": "/spec/resourceQuotas/items/0/hard/services.nodeports",
+            "value": str(cur),
+        },
+        {
+            "op": "replace",
+            "path": "/spec/resourceQuotas/items/0/hard/services.nodeports",
+            "value": str(new),
+        },
+    ]
+
+    args = [
+        "patch", "tenant", tenant_name,
+        "--type=json",
+        "-p", json.dumps(patch_ops),
+    ]
+    if dry_run:
+        args += ["--dry-run=server", "-o", "yaml"]
+
+    kubectl(args, cfg)
+    return cur, new
+
+
+# ---------------------------------------------------------------------------
+# NEW: Tenant Namespace Discovery (for HAProxy whitelist)
+# ---------------------------------------------------------------------------
+def get_tenant_namespaces(cfg: dict, tenant_name: str) -> list[str]:
+    """
+    Discover all Kubernetes Namespaces belonging to this Capsule Tenant,
+    using the label selector defined in config (capsule_tenant_label).
+
+    Returns a sorted, deduplicated list of namespace names.
+    This list is used to build the HAProxy Ingress Controller namespace
+    whitelist -- preventing it from watching ALL namespaces and causing OOM.
+    """
+    label_key = deep_get(
+        cfg,
+        "haproxy.capsule_tenant_label",
+        "capsule.clastix.io/tenant",
+    )
+    selector = f"{label_key}={tenant_name}"
+
+    log.info(
+        "  [Whitelist] Discovering namespaces for tenant=%s (label: %s)",
+        tenant_name,
+        selector,
+    )
+
+    res = kubectl(
+        ["get", "ns", "-l", selector, "-o", "json"],
+        cfg,
+    )
+    data = json.loads(res.stdout)
+    names = sorted(
+        set(item["metadata"]["name"] for item in data.get("items", []))
+    )
+
+    if not names:
+        raise TenantSkip(
+            f"No namespaces found for tenant={tenant_name} "
+            f"with label {selector}. "
+            f"Refusing to install with empty whitelist (would cause full-watch OOM)."
+        )
+
+    log.info(
+        "  [Whitelist] Found %d namespace(s): %s",
+        len(names),
+        ", ".join(names),
+    )
+    return names
+
+
+def build_whitelist_override_yaml(
+    cfg: dict,
+    namespaces: list[str],
+) -> str:
+    """
+    Build a temporary Helm values YAML that injects the namespace whitelist.
+
+    The values key path is read from config:
+      haproxy.namespace_whitelist_values_key
+      e.g. "controller.namespaceWhitelist"
+
+    We write a proper YAML list (not a comma-string) to be safe across
+    different chart implementations. If your chart needs a comma-separated
+    string instead, flip USE_LIST = False below.
+    """
+    USE_LIST = True  # set False if your chart expects "ns1,ns2,ns3" string
+
+    values_key = deep_get(
+        cfg,
+        "haproxy.namespace_whitelist_values_key",
+        "controller.namespaceWhitelist",
+    )
+
+    # Build nested dict from dotpath key
+    # e.g. "controller.namespaceWhitelist" -> {"controller": {"namespaceWhitelist": ...}}
+    keys = values_key.split(".")
+    value = namespaces if USE_LIST else ",".join(namespaces)
+
+    root: dict = {}
+    cur = root
+    for k in keys[:-1]:
+        cur[k] = {}
+        cur = cur[k]
+    cur[keys[-1]] = value
+
+    return yaml.dump(root, default_flow_style=False, allow_unicode=True)
+
+
+# ---------------------------------------------------------------------------
+# Tenant Discovery (Capsule Tenant CRs)
+# ---------------------------------------------------------------------------
+def discover_tenants(cfg: dict) -> list[TenantInfo]:
+    """
+    Discover all Capsule Tenant CRs and build TenantInfo list.
+    Naming convention: t-<userid>-<tenant_name>-ingress
+    """
+    log.info("[Discovery] Fetching Capsule Tenant CRs...")
+
+    res = kubectl(
+        ["get", "tenants.capsule.clastix.io", "-o", "json"],
+        cfg,
+    )
+    tenant_crds = json.loads(res.stdout)
+
+    skip = set(deep_get(cfg, "skip_tenants", []) or [])
+    whitelist = set(deep_get(cfg, "tenant_whitelist", []) or [])
+    prefix = must_get(cfg, "haproxy.ingress_class_prefix")
+    offset = must_get(cfg, "nodeport.offset")
+    port_min = must_get(cfg, "nodeport.range_min")
+    port_max = must_get(cfg, "nodeport.range_max")
+    overrides = deep_get(cfg, "tenant_overrides", {}) or {}
+
+    infos: list[TenantInfo] = []
+
+    for item in tenant_crds.get("items", []):
+        name: str = item["metadata"]["name"]
+
+        # Filter: skip list
+        if name in skip:
+            log.info("  Skipping (skip_tenants): %s", name)
+            continue
+
+        # Filter: tenant whitelist (controls WHICH tenants to migrate)
+        if whitelist and name not in whitelist:
+            log.info("  Skipping (not in tenant_whitelist): %s", name)
+            continue
+
+        # Validate naming convention: t-<userid>-<tenant>-ingress
+        if not _is_valid_tenant_name(name):
+            log.warning("  Skipping (naming mismatch): %s", name)
+            continue
+
+        user_id, tenant_short = _parse_tenant_name(name)
+        namespace = name  # Capsule convention: namespace == tenant name
+
+        # Ingress class
+        override = overrides.get(name, {})
+        ingress_class = override.get(
+            "ingress_class", f"{prefix}-{tenant_short}"
+        )
+
+        # NodePort: read from existing NGINX service, apply offset
+        old_np = _get_nginx_nodeport(cfg, namespace)
+        if old_np <= 0:
+            log.warning(
+                "  Skipping %s: cannot find existing NGINX NodePort", name
+            )
+            continue
+
+        new_np = override.get("nodeport_https", old_np + offset)
+        if not (port_min <= new_np <= port_max):
+            log.warning(
+                "  Skipping %s: computed NodePort %d out of range [%d, %d]",
+                name, new_np, port_min, port_max,
+            )
+            continue
+
+        infos.append(
+            TenantInfo(
+                tenant_full=name,
+                namespace=namespace,
+                user_id=user_id,
+                tenant_short=tenant_short,
+                ingress_class=ingress_class,
+                old_nodeport_https=old_np,
+                new_nodeport_https=new_np,
+            )
+        )
+        log.info(
+            "  Discovered: %-50s ingress_class=%-30s nodeport: %d -> %d",
+            name, ingress_class, old_np, new_np,
+        )
+
+    if not infos:
+        raise MigrationAbort(
+            "No eligible tenants found. Check naming convention and config."
+        )
+
+    return infos
+
+
+def _is_valid_tenant_name(name: str) -> bool:
+    parts = name.split("-")
+    # t-<userid>-<tenant>-ingress (minimum 4 parts)
+    return len(parts) >= 4 and parts[0] == "t" and parts[-1] == "ingress"
+
+
+def _parse_tenant_name(name: str) -> tuple[str, str]:
+    """
+    name: t-<userid>-<tenant_short>-ingress
+    Returns: (user_id, tenant_short)
+    """
+    parts = name.split("-")
+    user_id = parts[1]
+    tenant_short = "-".join(parts[2:-1])
+    return user_id, tenant_short
+
+
+def _get_nginx_nodeport(cfg: dict, namespace: str) -> int:
+    """
+    Find the existing NGINX Ingress Controller service in the given namespace
+    and return its https NodePort.
+    """
+    try:
+        res = kubectl(
+            [
+                "get", "svc", "-n", namespace,
+                "-l", "app.kubernetes.io/name=ingress-nginx",
+                "-o",
+                'jsonpath={.items[0].spec.ports[?(@.name=="https")].nodePort}',
+            ],
+            cfg,
+        )
+        val = res.stdout.strip()
+        return int(val) if val else -1
+    except (subprocess.CalledProcessError, ValueError):
+        return -1
+
+
+# ---------------------------------------------------------------------------
+# Check: existing HAProxy release
+# ---------------------------------------------------------------------------
+def namespace_has_haproxy_by_helm(cfg: dict, namespace: str) -> tuple[bool, str]:
+    """
+    Returns (True, reason) if the namespace already has an HAProxy Ingress
+    release (chart name contains 'kubernetes-ingress').
+    """
+    ctx = deep_get(cfg, "cluster.context", "")
+    args = ["list", "-n", namespace, "-o", "json"]
+    if ctx:
+        args += ["--kube-context", ctx]
+
+    res = helm(args, capture=True, check=True)
+    rels = json.loads(res.stdout) if res.stdout.strip() else []
+
+    for r in rels:
+        chart = (r.get("chart") or "").lower()
+        name = (r.get("name") or "").strip()
+        if "kubernetes-ingress" in chart:
+            return True, f"found release={name} chart={r.get('chart')}"
+
+    return False, "not found"
+
+
+# ---------------------------------------------------------------------------
+# Values Rendering (Jinja2 template)
+# ---------------------------------------------------------------------------
+def render_values(cfg: dict, tenant: TenantInfo) -> Path:
+    template_path = Path(must_get(cfg, "haproxy.values_template"))
+    output_dir = (
+        Path(must_get(cfg, "execution.values_output_dir")) / tenant.tenant_full
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / "values.yaml"
+
+    env = Environment(
+        loader=FileSystemLoader(str(template_path.parent)),
+        undefined=StrictUndefined,
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    template = env.get_template(template_path.name)
+
+    ctx = {
+        "tenant_full": tenant.tenant_full,
+        "namespace": tenant.namespace,
+        "user_id": tenant.user_id,
+        "tenant_short": tenant.tenant_short,
+        "ingress_class": tenant.ingress_class,
+        "nodeport_https": tenant.new_nodeport_https,
+        "cr_global_cr_name": must_get(cfg, "haproxy.cr_global_cr_name"),
+        "rendered_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    rendered = template.render(**ctx)
+    output_file.write_text(rendered)
+    log.debug("  Rendered values -> %s", output_file)
+    return output_file
+
+
+# ---------------------------------------------------------------------------
+# Helm Deploy
+# ---------------------------------------------------------------------------
+def helm_add_repo(cfg: dict) -> None:
+    repo_name = must_get(cfg, "haproxy.chart_repo")
+    repo_url = must_get(cfg, "haproxy.chart_repo_url")
+    log.info("[Helm] Adding repo %s -> %s", repo_name, repo_url)
+    helm(["repo", "add", repo_name, repo_url, "--force-update"])
+    helm(["repo", "update"])
+
+
+def deploy_tenant(
+    cfg: dict,
+    tenant: TenantInfo,
+    values_file: Path,
+    whitelist_override_yaml: str,
+) -> str:
+    """
+    Helm upgrade --install for a single tenant.
+
+    NEW: Writes a temporary whitelist override values file and passes it
+    as a second -f argument AFTER the main values file, so the whitelist
+    takes precedence and the HAProxy controller only watches the
+    namespaces that belong to this tenant.
+
+    Returns helm release name.
+    """
+    chart = must_get(cfg, "haproxy.chart_name")
+    version = must_get(cfg, "haproxy.chart_version")
+    release = f"haproxy-{tenant.tenant_short}"
+    namespace = tenant.namespace
+    ctx = deep_get(cfg, "cluster.context", "")
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".whitelist-override.yaml",
+        delete=False,
+        encoding="utf-8",
+    ) as tmp:
+        tmp.write(whitelist_override_yaml)
+        whitelist_file = tmp.name
+
+    log.info(
+        "  [Whitelist] Wrote override values -> %s\n%s",
+        whitelist_file,
+        whitelist_override_yaml.strip(),
+    )
+
+    try:
+        cmd = [
+            "helm", "upgrade", "--install",
+            release, chart,
+            "--namespace", namespace,
+            "--create-namespace",
+            "--version", version,
+            "--values", str(values_file),           # base values (Jinja2 rendered)
+            "--values", whitelist_file,              # NEW: namespace whitelist override
+            "--atomic",
+            "--timeout", "5m",
+            "--wait",
+        ]
+        if ctx:
+            cmd += ["--kube-context", ctx]
+
+        log.info(
+            "  [Helm] upgrade --install release=%s namespace=%s",
+            release, namespace,
+        )
+        run(cmd, capture=False)
+
+    finally:
+        # Always clean up temp file
+        try:
+            os.unlink(whitelist_file)
+        except OSError:
+            pass
+
+    return release
+
+
+# ---------------------------------------------------------------------------
+# ResourceQuota Patch
+# ---------------------------------------------------------------------------
+def patch_resource_quota(cfg: dict, tenant: TenantInfo) -> None:
+    """
+    Optionally patch ResourceQuota in tenant namespace to account for
+    HAProxy ingress controller additional pods.
+    Currently: no-op placeholder -- extend as needed.
+    """
+    log.info(
+        "  [Quota] ResourceQuota patch for %s (user_id=%s) -- no-op in this version",
+        tenant.namespace,
+        tenant.user_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-Tenant Migration  <-- MAIN FLOW WITH NEW LOGIC
+# ---------------------------------------------------------------------------
+def migrate_tenant(cfg: dict, tenant: TenantInfo) -> TenantResult:
+    dry_run = deep_get(cfg, "execution.dry_run", False)
+    result = TenantResult(
+        tenant_full=tenant.tenant_full,
+        status="failed",
+        ingress_class=tenant.ingress_class,
+        nodeport_https=tenant.new_nodeport_https,
+    )
+
+    try:
+        log.info("[Tenant] Processing: %s", tenant.tenant_full)
+
+        # ---- Gate: skip if HAProxy already deployed in this namespace ----
+        has_hp, reason = namespace_has_haproxy_by_helm(cfg, tenant.namespace)
+        if has_hp:
+            raise TenantSkip(f"HAProxy already deployed: {reason}")
+
+        # ---- Gate: skip if namespace has >1 NodePort (manual handling) ----
+        np_port_count, np_details = count_nodeport_ports_in_namespace(
+            cfg, tenant.namespace
+        )
+        if np_port_count > 1:
+            detail_str = "; ".join(
+                f"{d['service']}:{d.get('port_name', '')} nodePort={d['nodePort']}"
+                for d in np_details
+            )
+            raise TenantSkip(
+                f"namespace {tenant.namespace} has {np_port_count} NodePort ports (>1); "
+                f"skip for manual handling. Details: {detail_str}"
+            )
+
+        # ---- Step 1: Render base values (Jinja2) ----
+        values_file = render_values(cfg, tenant)
+        log.info("  Values rendered -> %s", values_file)
+
+        # ---- Step 2: NEW -- Discover tenant namespaces -> build whitelist ----
+        tenant_namespaces = get_tenant_namespaces(cfg, tenant.tenant_full)
+        whitelist_override_yaml = build_whitelist_override_yaml(
+            cfg, tenant_namespaces
+        )
+
+        if dry_run:
+            log.info(
+                "  [DRY-RUN] Would inject namespace whitelist:\n%s",
+                whitelist_override_yaml.strip(),
+            )
+            log.info("  [DRY-RUN] Skipping helm deploy and quota patch.")
+            result.status = "skipped"
+            result.reason = "dry_run=true"
+            result.helm_release = f"haproxy-{tenant.tenant_short} (dry-run)"
+            return result
+
+        # ---- Step 3: Bump Capsule Tenant quota: services.nodeports (+1) ----
+        old_npq = new_npq = None
+        try:
+            old_npq, new_npq = bump_tenant_services_nodeports(
+                cfg,
+                tenant_name=tenant.tenant_full,
+                delta=1,
+                dry_run=False,
+            )
+            log.info(
+                "  [CapsuleQuota] %s services.nodeports: %s -> %s",
+                tenant.tenant_full, old_npq, new_npq,
+            )
+
+            # ---- Step 4: Helm deploy (with whitelist injected) ----
+            release = deploy_tenant(
+                cfg, tenant, values_file, whitelist_override_yaml
+            )
+            result.helm_release = release
+
+        except Exception:
+            # Best-effort rollback: revert quota bump on failure
+            if old_npq is not None:
+                try:
+                    patch_ops = [
+                        {
+                            "op": "replace",
+                            "path": "/spec/resourceQuotas/items/0/hard/services.nodeports",
+                            "value": str(old_npq),
+                        }
+                    ]
+                    kubectl(
+                        [
+                            "patch", "tenant", tenant.tenant_full,
+                            "--type=json",
+                            "-p", json.dumps(patch_ops),
+                        ],
+                        cfg,
+                    )
+                    log.warning(
+                        "  [CapsuleQuota] Rolled back %s services.nodeports to %s",
+                        tenant.tenant_full, old_npq,
+                    )
+                except Exception as re:
+                    log.error(
+                        "  [CapsuleQuota] Rollback FAILED for %s: %s",
+                        tenant.tenant_full, re,
+                        exc_info=True,
+                    )
+            raise
+
+        # ---- Step 5: ResourceQuota patch (placeholder) ----
+        patch_resource_quota(cfg, tenant)
+
+        result.status = "success"
+        log.info("  [OK] %s migrated successfully.", tenant.tenant_full)
+
+    except TenantSkip as e:
+        result.status = "skipped"
+        result.reason = str(e)
+        log.warning("  [SKIP] %s: %s", tenant.tenant_full, e)
+
+    except Exception as e:
+        result.status = "failed"
+        result.reason = str(e)
+        log.error("  [FAIL] %s: %s", tenant.tenant_full, e, exc_info=True)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Report Generation
+# ---------------------------------------------------------------------------
+def generate_reports(cfg: dict, results: list[TenantResult]) -> None:
+    report_dir = Path(must_get(cfg, "execution.report_dir"))
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now(timezone.utc).isoformat()
+    total = len(results)
+    success = sum(1 for r in results if r.status == "success")
+    failed = sum(1 for r in results if r.status == "failed")
+    skipped = sum(1 for r in results if r.status == "skipped")
+
+    # ---- JSON report ----
+    json_path = report_dir / "report.json"
+    json_data = {
+        "generated_at": now,
+        "summary": {
+            "total": total,
+            "success": success,
+            "failed": failed,
+            "skipped": skipped,
+        },
+        "tenants": [asdict(r) for r in results],
+    }
+    json_path.write_text(
+        json.dumps(json_data, indent=2, ensure_ascii=False)
+    )
+    log.info("[Report] JSON -> %s", json_path)
+
+    # ---- Markdown report ----
+    md_path = report_dir / "report.md"
+    lines = [
+        "# HAProxy Ingress Migration Report",
+        "",
+        f"**Generated:** {now}",
+        "",
+        "## Summary",
+        "",
+        "| Total | Success | Failed | Skipped |",
+        "|-------|---------|--------|---------|",
+        f"| {total} | {success} | {failed} | {skipped} |",
+        "",
+        "## Tenant Results",
+        "",
+        "| Tenant | Status | IngressClass | NodePort (https) | Helm Release | Reason |",
+        "|--------|--------|--------------|-----------------|--------------|--------|",
+    ]
+
+    for r in results:
+        status_icon = {
+            "success": "OK",
+            "failed": "FAIL",
+            "skipped": "SKIP",
+        }.get(r.status, r.status)
+
+        lines.append(
+            f"| {r.tenant_full} "
+            f"| **{status_icon}** "
+            f"| `{r.ingress_class}` "
+            f"| `{r.nodeport_https}` "
+            f"| `{r.helm_release}` "
+            f"| {r.reason} |"
+        )
+
+    lines += [
+        "",
+        "---",
+        "_Generated by haproxy-migrate_",
+    ]
+
+    md_path.write_text("\n".join(lines))
+    log.info("[Report] Markdown -> %s", md_path)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    config_path = os.environ.get("MIGRATION_CONFIG", "config.yaml")
+    if len(sys.argv) > 1:
+        config_path = sys.argv[1]
+
+    log.info("Loading config from: %s", config_path)
+    cfg = load_config(config_path)
+
+    dry_run = deep_get(cfg, "execution.dry_run", False)
+    if dry_run:
+        log.info("*** DRY-RUN MODE: No changes will be applied ***")
+
+    # ---- Step 1: Pre-flight (global gates) ----
+    try:
+        check_infra_cpu(cfg)
+    except MigrationAbort as e:
+        log.critical(str(e))
+        sys.exit(1)
+
+    # ---- Step 2: Discover tenants (from Capsule Tenant CRs) ----
+    try:
+        tenant_infos = discover_tenants(cfg)
+    except MigrationAbort as e:
+        log.critical(str(e))
+        sys.exit(1)
+
+    log.info("[Discovery] Total eligible tenants: %d", len(tenant_infos))
+
+    # ---- Step 3: NodePort conflict check ----
+    try:
+        check_nodeport_conflicts(cfg, tenant_infos)
+    except MigrationAbort as e:
+        log.critical(str(e))
+        sys.exit(1)
+
+    # ---- Step 4: Add helm repo (skip in dry-run) ----
+    if not dry_run:
+        try:
+            helm_add_repo(cfg)
+        except Exception as e:
+            log.critical("[ABORT] Failed to add Helm repo: %s", e)
+            sys.exit(1)
+
+    # ---- Step 5: Migrate tenants ----
+    results: list[TenantResult] = []
+    parallelism = deep_get(cfg, "execution.parallel", 1)
+
+    if parallelism > 1:
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            futures = {
+                executor.submit(migrate_tenant, cfg, t): t
+                for t in tenant_infos
+            }
+            for future in as_completed(futures):
+                results.append(future.result())
+    else:
+        for t in tenant_infos:
+            results.append(migrate_tenant(cfg, t))
+
+    # Sort for consistent report ordering
+    results.sort(key=lambda r: r.tenant_full)
+
+    # ---- Step 6: Generate reports ----
+    generate_reports(cfg, results)
+
+    # ---- Step 7: Exit code ----
+    failed_count = sum(1 for r in results if r.status == "failed")
+    if failed_count > 0:
+        log.error(
+            "[DONE] Migration completed with %d failure(s). Check report.",
+            failed_count,
+        )
+        sys.exit(1)
+    else:
+        log.info(
+            "[DONE] Migration completed successfully. %d tenant(s) processed.",
+            len(results),
+        )
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
