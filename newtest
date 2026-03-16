@@ -1,3 +1,14 @@
+{% for ns in namespace_whitelist %}
+    - --namespace-whitelist={{ ns }}
+{% endfor %}
+
+tenant_namespaces = get_tenant_namespaces(cfg, tenant.tenant_full)
+ 
+ctx = {
+    # ...你原有的变量
+    "namespace_whitelist": tenant_namespaces,
+}
+rendered = template.render(**ctx)
 #!/usr/bin/env python3
 """
 HAProxy Ingress Controller Migration Script
