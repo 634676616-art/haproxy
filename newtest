@@ -1,4 +1,4 @@
-helm list -n t-14985-rdcmbkcn-ingress | grep kubernetes-ingress | awk '{printf "\"release_name\": \"%s\", \"%s\"\n", $1, $2}'
+
 
 
 def generate_yaml_files():
