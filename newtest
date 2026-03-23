@@ -1,3 +1,31 @@
+def generate_yaml_files():
+    # 创建输出目录
+    output_dir = "deploy_yamls"
+    os.makedirs(output_dir, exist_ok=True)
+ 
+    # 2. 加载当前目录下的模板文件
+    env = Environment(loader=FileSystemLoader('.'))
+    template = env.get_template('template.yaml')
+ 
+    # 3. 遍历你的 List 批量生成文件
+    for data in tenant_data_list:
+        # 渲染模板，将字典解包传递给模板
+        rendered_yaml = template.render(**data)
+        
+        # 定义输出文件名，通常用 tenant 名字来命名文件
+        file_name = f"{data['tenant_name']}-deploy.yaml"
+        file_path = os.path.join(output_dir, file_name)
+        
+        # 将渲染好的内容写入文件
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(rendered_yaml)
+            
+        print(f"✅ 成功生成: {file_path}")
+ 
+if __name__ == "__main__":
+    generate_yaml_files()
+ 
+
 {% for ns in namespace_whitelist %}
     - --namespace-whitelist={{ ns }}
 {% endfor %}
