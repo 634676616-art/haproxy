@@ -1,3 +1,30 @@
+                # 3. Annotation Conversion Logic
+                for key, value in old_annos.items():
+                    # Skip the old ingress class annotation; we will force it to 'haproxy' later
+                    if key == "kubernetes.io/ingress.class":
+                        continue
+                        
+                    if key in ANNOTATION_DB:
+                        rule = ANNOTATION_DB[key]
+                        
+                        # 修复点：将 direct 和 configmap 分开处理
+                        if rule['type'] == 'direct':
+                            # Direct 必须有 target
+                            new_annos[rule['target']] = value
+                            
+                        elif rule['type'] == 'configmap':
+                            # ConfigMap 可能没有 target，使用安全的 .get() 方法，如果没有 target 就用原 key 代替显示
+                            display_name = rule.get('target', key)
+                            notices.append(f"[ConfigMap] {display_name}: {rule.get('note', '')}")
+                            
+                        else:
+                            # 处理 complex 等其他类型
+                            notices.append(f"[Manual] {key}: See {rule.get('doc', 'N/A')}")
+                            
+                    elif "nginx.ingress.kubernetes.io" in key:
+                        notices.append(f"[Unknown] {key}: Not found in mapping database.")
+
+
 import argparse
 import yaml
 import sys
